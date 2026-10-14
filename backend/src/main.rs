@@ -97,10 +97,24 @@ struct UploadPrekeysRequest {
     one_time_prekeys: Vec<String>,
 }
 
+#[derive(Deserialize)]
+struct AppendPrekeysRequest {
+    username: String,
+    one_time_prekeys: Vec<String>,
+}
+
 #[derive(Serialize)]
 struct UploadPrekeysResponse {
     success: bool,
     message: String,
+}
+
+#[derive(Serialize)]
+struct PrekeysCountResponse {
+    success: bool,
+    username: String,
+    count: usize,
+    signed_prekey_present: bool,
 }
 
 #[derive(Serialize)]
@@ -110,6 +124,7 @@ struct PrekeyBundleResponse {
     identity_key: Option<String>,
     signed_prekey: Option<String>,
     one_time_prekey: Option<String>, // consumed if present
+    opks_remaining: usize,
     message: String,
 }
 
@@ -215,6 +230,8 @@ async fn main() {
         .route("/api/login", post(login))
         .route("/api/public-key/{username}", get(get_public_key))
         .route("/api/prekeys", post(upload_prekeys))
+        .route("/api/prekeys/append", post(append_prekeys))
+        .route("/api/prekeys-count/{username}", get(get_prekeys_count))
         .route("/api/prekey-bundle/{username}", get(get_prekey_bundle))
         .route("/ws", get(ws_handler))
         .layer(cors)
@@ -404,6 +421,69 @@ async fn upload_prekeys(
     }
 }
 
+async fn append_prekeys(
+    State(state): State<AppState>,
+    Json(payload): Json<AppendPrekeysRequest>,
+) -> impl IntoResponse {
+    let username = payload.username.trim().to_lowercase();
+    let mut users = state.users.lock().await;
+
+    if let Some(user) = users.get_mut(&username) {
+        let added = payload.one_time_prekeys.len();
+        user.one_time_prekeys.extend(payload.one_time_prekeys);
+        let total = user.one_time_prekeys.len();
+        let name = user.username.clone();
+
+        save_users(&users);
+
+        tracing::info!("Appended {} prekeys for {} (total: {})", added, name, total);
+        (
+            StatusCode::OK,
+            Json(UploadPrekeysResponse {
+                success: true,
+                message: format!("Appended {} prekeys (pool size: {})", added, total),
+            }),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(UploadPrekeysResponse {
+                success: false,
+                message: format!("User '{}' not found", username),
+            }),
+        )
+    }
+}
+
+async fn get_prekeys_count(
+    State(state): State<AppState>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let username = username.trim().to_lowercase();
+    let users = state.users.lock().await;
+
+    match users.get(&username) {
+        Some(user) => (
+            StatusCode::OK,
+            Json(PrekeysCountResponse {
+                success: true,
+                username: user.username.clone(),
+                count: user.one_time_prekeys.len(),
+                signed_prekey_present: user.signed_prekey.is_some(),
+            }),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(PrekeysCountResponse {
+                success: false,
+                username,
+                count: 0,
+                signed_prekey_present: false,
+            }),
+        ),
+    }
+}
+
 async fn get_prekey_bundle(
     State(state): State<AppState>,
     axum::extract::Path(username): axum::extract::Path<String>,
@@ -422,15 +502,16 @@ async fn get_prekey_bundle(
             } else {
                 None
             };
+            let opks_remaining = user.one_time_prekeys.len();
             let name = user.username.clone();
-            Some(Ok((name, identity_key, signed_prekey, one_time_prekey)))
+            Some(Ok((name, identity_key, signed_prekey, one_time_prekey, opks_remaining)))
         }
     } else {
         None
     };
 
     match result {
-        Some(Ok((name, identity_key, signed_prekey, one_time_prekey))) => {
+        Some(Ok((name, identity_key, signed_prekey, one_time_prekey, opks_remaining))) => {
             save_users(&users);
             (
                 StatusCode::OK,
@@ -440,6 +521,7 @@ async fn get_prekey_bundle(
                     identity_key,
                     signed_prekey,
                     one_time_prekey,
+                    opks_remaining,
                     message: "Prekey bundle ready".into(),
                 }),
             )
@@ -452,6 +534,7 @@ async fn get_prekey_bundle(
                 identity_key: None,
                 signed_prekey: None,
                 one_time_prekey: None,
+                opks_remaining: 0,
                 message: "User has no prekeys uploaded yet".into(),
             }),
         ),
@@ -463,6 +546,7 @@ async fn get_prekey_bundle(
                 identity_key: None,
                 signed_prekey: None,
                 one_time_prekey: None,
+                opks_remaining: 0,
                 message: "User not found".into(),
             }),
         ),

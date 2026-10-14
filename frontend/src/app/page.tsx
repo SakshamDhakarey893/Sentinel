@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, KeyboardEvent, useCallback } from "react";
+import QRCode from "qrcode";
 
 const API_BASE = "http://localhost:8080";
 const WS_URL = "ws://localhost:8080/ws";
@@ -121,6 +122,55 @@ async function kdfX3DH(dhOutputs: ArrayBuffer[]): Promise<ArrayBuffer> {
   return hmac(key, new TextEncoder().encode("SentinelX3DH"));
 }
 
+// ─── Constant-Length Message Padding (Traffic Analysis Defense) ─────────────
+// Discretizes message lengths into fixed-tier blocks to prevent eavesdroppers
+// from inferring message content from ciphertext packet lengths.
+
+function padPlaintext(plaintext: string): Uint8Array {
+  const enc = new TextEncoder().encode(plaintext);
+  const len = enc.length;
+  let targetSize = 128;
+  const needed = len + 4;
+  const tiers = [128, 256, 512, 1024, 2048, 4096];
+  for (const t of tiers) {
+    if (needed <= t) {
+      targetSize = t;
+      break;
+    }
+  }
+  if (needed > 4096) {
+    targetSize = Math.ceil(needed / 1024) * 1024;
+  }
+
+  const padded = new Uint8Array(targetSize);
+  padded[0] = (len >> 24) & 0xff;
+  padded[1] = (len >> 16) & 0xff;
+  padded[2] = (len >> 8) & 0xff;
+  padded[3] = len & 0xff;
+  padded.set(enc, 4);
+
+  if (targetSize > needed) {
+    const padSlice = new Uint8Array(targetSize - needed);
+    crypto.getRandomValues(padSlice);
+    padded.set(padSlice, needed);
+  }
+  return padded;
+}
+
+function unpadPlaintext(decryptedBytes: Uint8Array): string {
+  if (decryptedBytes.length >= 4) {
+    const len =
+      (decryptedBytes[0] << 24) |
+      (decryptedBytes[1] << 16) |
+      (decryptedBytes[2] << 8) |
+      decryptedBytes[3];
+    if (len >= 0 && 4 + len <= decryptedBytes.length) {
+      return new TextDecoder().decode(decryptedBytes.slice(4, 4 + len));
+    }
+  }
+  return new TextDecoder().decode(decryptedBytes);
+}
+
 async function encryptWithMessageKey(
   messageKey: ArrayBuffer,
   plaintext: string,
@@ -133,11 +183,11 @@ async function encryptWithMessageKey(
     ["encrypt"],
   );
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encoded = new TextEncoder().encode(plaintext);
+  const padded = padPlaintext(plaintext);
   const ciphertext = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv },
     aesKey,
-    encoded,
+    padded as unknown as BufferSource,
   );
   const combined = new Uint8Array(iv.length + ciphertext.byteLength);
   combined.set(iv, 0);
@@ -164,7 +214,38 @@ async function decryptWithMessageKey(
     aesKey,
     data,
   );
-  return new TextDecoder().decode(decrypted);
+  return unpadPlaintext(new Uint8Array(decrypted));
+}
+
+const EMOJI_FINGERPRINT_POOL = [
+  "🛡️", "⚡", "🔒", "🔑", "🛰️", "🛸", "💎", "🔮",
+  "🧬", "🌌", "⚓", "⚔️", "👁️", "🎯", "🔥", "🪐",
+];
+
+async function computeVisualEmojiHash(safetyNumber: string): Promise<string> {
+  const enc = new TextEncoder().encode(safetyNumber);
+  const digest = await crypto.subtle.digest("SHA-256", enc);
+  const bytes = new Uint8Array(digest);
+  const emojis: string[] = [];
+  for (let i = 0; i < 4; i++) {
+    const idx = (bytes[i] ^ bytes[i + 4]) % EMOJI_FINGERPRINT_POOL.length;
+    emojis.push(EMOJI_FINGERPRINT_POOL[idx]);
+  }
+  return emojis.join("  ");
+}
+
+async function generateTerminalQr(
+  safetyNumber: string,
+  user1: string,
+  user2: string,
+): Promise<string> {
+  try {
+    const peers = [user1.toLowerCase(), user2.toLowerCase()].sort().join(",");
+    const payload = `sentinel://verify?peers=${peers}&sn=${safetyNumber.replace(/\s+/g, "")}`;
+    return await QRCode.toString(payload, { type: "terminal", small: true });
+  } catch {
+    return "";
+  }
 }
 
 async function computeSafetyNumber(
@@ -694,6 +775,8 @@ export default function Terminal() {
   const ratchetsByPeerRef = useRef<Map<string, RatchetState>>(new Map());
   const disappearTimersRef = useRef<Map<string, number>>(new Map());
   const vaultKeyRef = useRef<CryptoKey | null>(null);
+  const seenMessagesRef = useRef<Set<string>>(new Set());
+  const isReplenishingRef = useRef<boolean>(false);
 
   const pendingCiphertextsRef = useRef<
     Map<string, { id: string; header: any; body: string; from: string }[]>
@@ -717,6 +800,8 @@ export default function Terminal() {
     disappearTimersRef.current.forEach((t) => window.clearTimeout(t));
     disappearTimersRef.current.clear();
 
+    seenMessagesRef.current.clear();
+    isReplenishingRef.current = false;
     vaultKeyRef.current = null;
     privateKeyRef.current = null;
     myPublicKeyB64Ref.current = null;
@@ -901,6 +986,63 @@ export default function Terminal() {
       wsRef.current.send(JSON.stringify(obj));
     }
   }, []);
+
+  const replenishPrekeys = useCallback(
+    async (minThreshold = 5, batchSize = 15) => {
+      const currentName = usernameRef.current;
+      if (!currentName || !privateKeyRef.current || isReplenishingRef.current) return;
+
+      try {
+        isReplenishingRef.current = true;
+        const res = await fetch(`${API_BASE}/api/prekeys-count/${currentName}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!data.success) return;
+
+        if (data.count < minThreshold) {
+          addMessage(
+            "system",
+            `[Security] OPK prekey pool low (${data.count} left). Generating ${batchSize} fresh one-time prekeys...`,
+          );
+
+          const newOpks: { pub: string; priv: string }[] = [];
+          for (let i = 0; i < batchSize; i++) {
+            const kp = await generateKeyPair();
+            newOpks.push({
+              pub: await exportPublicKey(kp.publicKey),
+              priv: await exportPrivateKey(kp.privateKey),
+            });
+          }
+
+          const existingOpks = await loadOpks(currentName, vaultKeyRef.current);
+          const merged = [...existingOpks, ...newOpks];
+          await saveOpks(currentName, merged, vaultKeyRef.current);
+          opksRef.current = merged;
+
+          const appendRes = await fetch(`${API_BASE}/api/prekeys/append`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              username: currentName,
+              one_time_prekeys: newOpks.map((o) => o.pub),
+            }),
+          });
+          const appendData = await appendRes.json();
+          if (appendData.success) {
+            addMessage(
+              "system",
+              `[Security] Continuous forward secrecy renewed. Active OPK pool: ${data.count + batchSize}.`,
+            );
+          }
+        }
+      } catch (err) {
+        console.warn("Prekey auto-replenish skipped:", err);
+      } finally {
+        isReplenishingRef.current = false;
+      }
+    },
+    [addMessage],
+  );
 
   async function dhRatchetStep(
     state: RatchetState,
@@ -1239,6 +1381,7 @@ export default function Terminal() {
                       from,
                     );
                     await tryDecryptPending(from);
+                    void replenishPrekeys();
                   }
                 }
 
@@ -1259,6 +1402,22 @@ export default function Terminal() {
                   list.push({ id, header, body, from });
                   pendingCiphertextsRef.current.set(from, list);
                   break;
+                }
+
+                // Replay Protection: Drop duplicate packets
+                const packetFingerprint = `${from}:${header.dh || "0"}:${header.n}`;
+                if (seenMessagesRef.current.has(packetFingerprint)) {
+                  addMessage(
+                    "system",
+                    `⚠️ [Security Alert] Dropped duplicate / replayed packet (n=${header.n}) from ${from}.`,
+                    from,
+                  );
+                  break;
+                }
+                seenMessagesRef.current.add(packetFingerprint);
+                if (seenMessagesRef.current.size > 2000) {
+                  const firstKey = seenMessagesRef.current.keys().next().value;
+                  if (firstKey) seenMessagesRef.current.delete(firstKey);
                 }
 
                 let s: RatchetState = state;
@@ -1436,6 +1595,15 @@ export default function Terminal() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, activePeer]);
+
+  useEffect(() => {
+    if (!username || !hasKeys) return;
+    void replenishPrekeys();
+    const interval = setInterval(() => {
+      void replenishPrekeys();
+    }, 5 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, [username, hasKeys, replenishPrekeys]);
 
   const systemMessages = messages.filter((m) => m.type === "system");
   const chatMessages = messages.filter((m) => {
@@ -1813,11 +1981,19 @@ export default function Terminal() {
             "system",
             `X3DH + Double Ratchet session started with ${peer}.`,
           );
-          addMessage("system", "────────────────────────────────────────");
-          addMessage("system", "SAFETY NUMBER (compare with your contact):");
-          addMessage("system", safety);
-          addMessage("system", "────────────────────────────────────────");
+          const visualEmoji = await computeVisualEmojiHash(safety);
+          const qrAscii = await generateTerminalQr(safety, username, peer);
+
+          addMessage("system", "────────────────────────────────────────────────────────────");
+          addMessage("system", "🛡️  SAFETY NUMBER (Compare with peer to verify channel):");
+          addMessage("system", `FINGERPRINT:  ${safety}`);
+          addMessage("system", `VISUAL HASH:  [  ${visualEmoji}  ]`);
+          if (qrAscii) {
+            addMessage("system", "\nSCAN TO VERIFY (Phone Camera / QR Reader):\n" + qrAscii);
+          }
+          addMessage("system", "────────────────────────────────────────────────────────────");
           await tryDecryptPending(peer);
+          void replenishPrekeys();
         } catch (err) {
           console.error(err);
           addMessage("system", `Failed to set up session with ${peer}.`);
@@ -1826,14 +2002,42 @@ export default function Terminal() {
       }
 
       case "/verify": {
-        if (!activePeer || !safetyNumberRef.current) {
+        if (!activePeer || !username) {
           addMessage("system", "No active chat. Use /new <user> first.");
           break;
         }
-        addMessage("system", "────────────────────────────────────────");
-        addMessage("system", `Safety Number with ${activePeer}:`);
-        addMessage("system", safetyNumberRef.current);
-        addMessage("system", "────────────────────────────────────────");
+
+        let sn = safetyNumberRef.current;
+        if (!sn) {
+          try {
+            const res = await fetch(`${API_BASE}/api/public-key/${activePeer}`);
+            const data = await res.json();
+            if (data.success && data.public_key && myPublicKeyB64Ref.current) {
+              sn = await computeSafetyNumber(myPublicKeyB64Ref.current, data.public_key);
+              safetyNumberRef.current = sn;
+            }
+          } catch {}
+        }
+
+        if (!sn) {
+          addMessage("system", "Unable to compute safety number. Open a chat or /new <user>.");
+          break;
+        }
+
+        const visualEmoji = await computeVisualEmojiHash(sn);
+        const qrAscii = await generateTerminalQr(sn, username, activePeer);
+
+        addMessage("system", "────────────────────────────────────────────────────────────");
+        addMessage("system", `🛡️  SAFETY NUMBER VERIFICATION: ${username} ⟷ ${activePeer}`);
+        addMessage("system", "────────────────────────────────────────────────────────────");
+        addMessage("system", `FINGERPRINT:  ${sn}`);
+        addMessage("system", `VISUAL HASH:  [  ${visualEmoji}  ]`);
+        if (qrAscii) {
+          addMessage("system", "\nSCAN TO VERIFY (Camera / QR Reader):\n" + qrAscii);
+        }
+        addMessage("system", "Compare the visual emoji hash, the 30-digit fingerprint, or");
+        addMessage("system", "scan the QR code with your peer to ensure zero eavesdropping.");
+        addMessage("system", "────────────────────────────────────────────────────────────");
         break;
       }
 
@@ -1847,6 +2051,10 @@ export default function Terminal() {
   Backend:         ${connStatus.toUpperCase()}
   WebSocket auth:  ${wsAuthed ? "yes" : "no"}
   Local keys:      ${hasKeys ? "loaded" : "none"}
+  Prekeys in vault:${opksRef.current.length}
+  Forward secrecy: auto-replenishing active (X3DH + OPK)
+  Traffic defense: constant-size padding active (tiers 128B - 4KB)
+  Replay guard:    sliding window cache active
   Ratchet:         ${ratchetRef.current ? "active" : "none"}
   Disappear:       ${disappearMs ? formatDuration(disappearMs) : "off"}
   Chat history:    persisted on this device
