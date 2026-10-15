@@ -17,6 +17,12 @@ import {
   clearRuntimeServerConfig,
   ServerConfig,
 } from "@/lib/serverConfig";
+import {
+  authenticateWithRelay,
+  getStoredSessionToken,
+  saveStoredSessionToken,
+  clearStoredSessionToken,
+} from "@/lib/authClient";
 
 type Message = {
   id: string;
@@ -907,6 +913,7 @@ export default function Terminal() {
   const isReplenishingRef = useRef<boolean>(false);
   const tofuMismatchesRef = useRef<Set<string>>(new Set());
   const lastUserActivityRef = useRef<number>(Date.now());
+  const sessionTokenRef = useRef<string | null>(null);
 
   const pendingCiphertextsRef = useRef<
     Map<string, { id: string; header: any; body: string; from: string }[]>
@@ -950,6 +957,8 @@ export default function Terminal() {
     isReplenishingRef.current = false;
     zeroizeAllKeys();
     pendingCiphertextsRef.current.clear();
+    clearStoredSessionToken();
+    sessionTokenRef.current = null;
 
     try {
       const keysToPurge: string[] = [];
@@ -1289,12 +1298,17 @@ export default function Terminal() {
           await saveOpks(currentName, merged, vaultKeyRef.current);
           opksRef.current = merged;
 
+          const token = sessionTokenRef.current || getStoredSessionToken(currentName);
           const appendRes = await fetch(`${getApiBase()}/api/prekeys/append`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
             body: JSON.stringify({
               username: currentName,
               one_time_prekeys: newOpks.map((o) => o.pub),
+              token: token || undefined,
             }),
           });
           const appendData = await appendRes.json();
@@ -1546,12 +1560,29 @@ export default function Terminal() {
       const ws = new WebSocket(targetWs);
       wsRef.current = ws;
 
-      ws.onopen = () => {
+      ws.onopen = async () => {
         setConnStatus("online");
         addMessage("system", `Connected to Sentinel relay (${targetWs})`);
         if (usernameRef.current) {
+          const u = usernameRef.current;
+          let token = sessionTokenRef.current || getStoredSessionToken(u);
+          if (!token && privateKeyRef.current) {
+            const authRes = await authenticateWithRelay(
+              getApiBase(),
+              u,
+              privateKeyRef.current,
+            );
+            if (authRes.success && authRes.token) {
+              token = authRes.token;
+              sessionTokenRef.current = token;
+            }
+          }
           ws.send(
-            JSON.stringify({ type: "auth", username: usernameRef.current }),
+            JSON.stringify({
+              type: "auth",
+              username: u,
+              token: token || undefined,
+            }),
           );
         }
       };
@@ -2082,12 +2113,17 @@ export default function Terminal() {
           opksRef.current = opks;
           setHasKeys(true);
 
+          const existingToken = sessionTokenRef.current || getStoredSessionToken(name);
           const res = await fetch(`${getApiBase()}/api/register`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              ...(existingToken ? { Authorization: `Bearer ${existingToken}` } : {}),
+            },
             body: JSON.stringify({
               username: name,
               public_key: publicKeyB64,
+              token: existingToken || undefined,
             }),
           });
           const data = await res.json();
@@ -2097,13 +2133,22 @@ export default function Terminal() {
             break;
           }
 
+          if (data.token) {
+            sessionTokenRef.current = data.token;
+            saveStoredSessionToken(name, data.token);
+          }
+
           const preRes = await fetch(`${getApiBase()}/api/prekeys`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              ...(sessionTokenRef.current ? { Authorization: `Bearer ${sessionTokenRef.current}` } : {}),
+            },
             body: JSON.stringify({
               username: name,
               signed_prekey: spkPub,
               one_time_prekeys: opks.map((o) => o.pub),
+              token: sessionTokenRef.current || undefined,
             }),
           });
           await preRes.json();
@@ -2114,7 +2159,11 @@ export default function Terminal() {
             setContacts(saved);
           }
 
-          sendWs({ type: "auth", username: data.user.username });
+          sendWs({
+            type: "auth",
+            username: data.user.username,
+            token: sessionTokenRef.current || undefined,
+          });
           setUsersCount((c) => c + 1);
           addCommandResult(`Registered identity "${data.user.username}". E2EE prekeys ready.`, activePeer ?? undefined);
         } catch (err) {
@@ -2188,12 +2237,35 @@ export default function Terminal() {
           setHasKeys(true);
           setUsername(data.user.username);
 
+          // Authenticate with relay via cryptographic challenge-response
+          let token = getStoredSessionToken(data.user.username);
+          if (!token) {
+            logBackground("Solving cryptographic challenge from relay...");
+            const authRes = await authenticateWithRelay(
+              getApiBase(),
+              data.user.username,
+              privateKeyRef.current,
+            );
+            if (authRes.success && authRes.token) {
+              token = authRes.token;
+              sessionTokenRef.current = token;
+            } else {
+              addCommandResult(`⚠️ Relay challenge authentication failed: ${authRes.error}`, activePeer ?? undefined);
+            }
+          } else {
+            sessionTokenRef.current = token;
+          }
+
           const saved = listSavedPeers(name);
           setContacts(saved);
-          sendWs({ type: "auth", username: data.user.username });
+          sendWs({
+            type: "auth",
+            username: data.user.username,
+            token: sessionTokenRef.current || undefined,
+          });
 
           addCommandResult(
-            `Logged in as ${data.user.username}.${saved.length > 0 ? ` Loaded ${saved.length} contact(s).` : " Use /new <peer> to start a chat."}`,
+            `✓ Logged in as ${data.user.username} [Cryptographically Authenticated].${saved.length > 0 ? ` Loaded ${saved.length} contact(s).` : " Use /new <peer> to start a chat."}`,
             activePeer ?? undefined,
           );
         } catch {
@@ -2597,6 +2669,8 @@ export default function Terminal() {
         disappearTimersRef.current.forEach((t) => window.clearTimeout(t));
         disappearTimersRef.current.clear();
         setDisappearMs(null);
+        clearStoredSessionToken(username || undefined);
+        sessionTokenRef.current = null;
         setUsername(null);
         setActivePeer(null);
         setContacts([]);

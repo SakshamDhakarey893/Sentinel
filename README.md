@@ -124,8 +124,8 @@ You can point the Sentinel frontend or desktop app to any local or remote relay 
 - [x] Safety numbers, visual emoji fingerprints, and QR verification
 - [x] Zero-knowledge cloud vault backup & restore (AES-GCM + PBKDF2)
 - [x] Dynamic server configuration (environment variables & runtime `/server` command)
+- [x] Cryptographic challenge-response authentication on relay (ECDH + HMAC-SHA256 zero-knowledge proof)
 - [ ] Backend SQL database persistence (SQLite / PostgreSQL)
-- [ ] Cryptographic challenge-response authentication on relay
 
 ## License
 

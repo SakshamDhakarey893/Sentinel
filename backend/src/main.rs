@@ -3,20 +3,28 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
+use hmac::{Hmac, Mac};
+use p256::pkcs8::{DecodePublicKey, EncodePublicKey};
+use p256::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::{
     collections::HashMap,
     fs,
     net::SocketAddr,
     path::Path,
     sync::Arc,
+    time::Instant,
 };
+use p256::elliptic_curve::subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, Mutex};
 use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -30,6 +38,22 @@ struct AppState {
     users: Arc<Mutex<HashMap<String, User>>>,
     connections: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
     queue: Arc<Mutex<HashMap<String, Vec<QueuedMessage>>>>,
+    challenges: Arc<Mutex<HashMap<String, PendingChallenge>>>,
+    sessions: Arc<Mutex<HashMap<String, ActiveSession>>>,
+}
+
+#[derive(Clone)]
+struct PendingChallenge {
+    username: String,
+    expected_response: Vec<u8>,
+    created_at: Instant,
+}
+
+#[derive(Clone)]
+struct ActiveSession {
+    username: String,
+    #[allow(dead_code)]
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -54,6 +78,7 @@ struct QueuedMessage {
 struct RegisterRequest {
     username: String,
     public_key: Option<String>,
+    token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -61,6 +86,7 @@ struct RegisterResponse {
     success: bool,
     message: String,
     user: Option<User>,
+    token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -73,6 +99,36 @@ struct LoginResponse {
     success: bool,
     message: String,
     user: Option<User>,
+    requires_challenge: bool,
+}
+
+#[derive(Deserialize)]
+struct ChallengeRequest {
+    username: String,
+}
+
+#[derive(Serialize)]
+struct ChallengeResponse {
+    success: bool,
+    message: String,
+    challenge_id: Option<String>,
+    server_ephemeral_pub: Option<String>,
+    nonce: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VerifyChallengeRequest {
+    username: String,
+    challenge_id: String,
+    response: String,
+}
+
+#[derive(Serialize)]
+struct VerifyChallengeResponse {
+    success: bool,
+    token: Option<String>,
+    username: String,
+    message: String,
 }
 
 #[derive(Serialize)]
@@ -95,12 +151,14 @@ struct UploadPrekeysRequest {
     username: String,
     signed_prekey: String,
     one_time_prekeys: Vec<String>,
+    token: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct AppendPrekeysRequest {
     username: String,
     one_time_prekeys: Vec<String>,
+    token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -132,12 +190,89 @@ struct PrekeyBundleResponse {
 #[serde(tag = "type")]
 enum ClientMsg {
     #[serde(rename = "auth")]
-    Auth { username: String },
+    Auth {
+        username: String,
+        token: Option<String>,
+    },
     #[serde(rename = "message")]
     Message { to: String, text: String },
     #[serde(rename = "ping")]
     Ping,
 }
+
+// ─── Cryptographic Challenge-Response Helpers ──────────────────────────────
+
+fn compute_challenge_ecdh(
+    client_spki_b64: &str,
+) -> Result<(String, String, Vec<u8>), String> {
+    let der_bytes = BASE64
+        .decode(client_spki_b64.trim())
+        .map_err(|e| format!("Base64 decode error: {}", e))?;
+    let client_pub = PublicKey::from_public_key_der(&der_bytes)
+        .map_err(|e| format!("Invalid public key SPKI DER: {}", e))?;
+
+    let server_secret = SecretKey::random(&mut rand::thread_rng());
+    let server_pub = server_secret.public_key();
+    let server_pub_der = server_pub
+        .to_public_key_der()
+        .map_err(|e| format!("Failed to encode server public key: {}", e))?;
+    let server_pub_b64 = BASE64.encode(server_pub_der.as_bytes());
+
+    let shared = p256::ecdh::diffie_hellman(
+        server_secret.to_nonzero_scalar(),
+        client_pub.as_affine(),
+    );
+
+    let mut nonce = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
+    let nonce_b64 = BASE64.encode(&nonce);
+
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(shared.raw_secret_bytes().as_slice())
+        .map_err(|e| format!("HMAC init error: {}", e))?;
+    mac.update(&nonce);
+    let expected = mac.finalize().into_bytes().to_vec();
+
+    Ok((server_pub_b64, nonce_b64, expected))
+}
+
+fn extract_bearer_token(
+    headers: &HeaderMap,
+    fallback_token: Option<&str>,
+) -> Option<String> {
+    if let Some(auth_header) = headers.get(header::AUTHORIZATION) {
+        if let Ok(val) = auth_header.to_str() {
+            if let Some(token) = val.strip_prefix("Bearer ") {
+                let trimmed = token.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    fallback_token
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
+async fn verify_user_session(
+    state: &AppState,
+    username: &str,
+    headers: &HeaderMap,
+    fallback_token: Option<&str>,
+) -> bool {
+    let token = match extract_bearer_token(headers, fallback_token) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let sessions = state.sessions.lock().await;
+    match sessions.get(&token) {
+        Some(session) => session.username.eq_ignore_ascii_case(username),
+        None => false,
+    }
+}
+
 
 // ─── Persistence ────────────────────────────────────────────────────────────
 
@@ -216,6 +351,8 @@ async fn main() {
         users: Arc::new(Mutex::new(users)),
         connections: Arc::new(Mutex::new(HashMap::new())),
         queue: Arc::new(Mutex::new(queue)),
+        challenges: Arc::new(Mutex::new(HashMap::new())),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let cors = CorsLayer::new()
@@ -226,6 +363,8 @@ async fn main() {
     let app = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
+        .route("/api/auth/challenge", post(create_challenge))
+        .route("/api/auth/verify", post(verify_challenge))
         .route("/api/register", post(register))
         .route("/api/login", post(login))
         .route("/api/public-key/{username}", get(get_public_key))
@@ -259,8 +398,190 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
+async fn create_challenge(
+    State(state): State<AppState>,
+    Json(payload): Json<ChallengeRequest>,
+) -> impl IntoResponse {
+    let username = payload.username.trim().to_lowercase();
+    let users = state.users.lock().await;
+
+    let user = match users.get(&username) {
+        Some(u) => u.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ChallengeResponse {
+                    success: false,
+                    message: format!("User '{}' not found", username),
+                    challenge_id: None,
+                    server_ephemeral_pub: None,
+                    nonce: None,
+                }),
+            );
+        }
+    };
+    drop(users);
+
+    let pubkey_b64 = match user.public_key {
+        Some(ref pk) if !pk.is_empty() => pk.clone(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ChallengeResponse {
+                    success: false,
+                    message: format!("User '{}' has no registered public key", username),
+                    challenge_id: None,
+                    server_ephemeral_pub: None,
+                    nonce: None,
+                }),
+            );
+        }
+    };
+
+    match compute_challenge_ecdh(&pubkey_b64) {
+        Ok((server_pub_b64, nonce_b64, expected)) => {
+            let challenge_id = Uuid::new_v4().to_string();
+            let mut challenges = state.challenges.lock().await;
+            let now = Instant::now();
+            challenges.retain(|_, c| now.duration_since(c.created_at).as_secs() < 60);
+
+            challenges.insert(
+                challenge_id.clone(),
+                PendingChallenge {
+                    username: username.clone(),
+                    expected_response: expected,
+                    created_at: now,
+                },
+            );
+
+            (
+                StatusCode::OK,
+                Json(ChallengeResponse {
+                    success: true,
+                    message: "Cryptographic challenge created".into(),
+                    challenge_id: Some(challenge_id),
+                    server_ephemeral_pub: Some(server_pub_b64),
+                    nonce: Some(nonce_b64),
+                }),
+            )
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ChallengeResponse {
+                success: false,
+                message: format!("Failed to generate challenge: {}", err),
+                challenge_id: None,
+                server_ephemeral_pub: None,
+                nonce: None,
+            }),
+        ),
+    }
+}
+
+async fn verify_challenge(
+    State(state): State<AppState>,
+    Json(payload): Json<VerifyChallengeRequest>,
+) -> impl IntoResponse {
+    let username = payload.username.trim().to_lowercase();
+    let challenge_id = payload.challenge_id.trim();
+
+    let mut challenges = state.challenges.lock().await;
+    let challenge = match challenges.remove(challenge_id) {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(VerifyChallengeResponse {
+                    success: false,
+                    token: None,
+                    username,
+                    message: "Challenge expired or invalid".into(),
+                }),
+            );
+        }
+    };
+    drop(challenges);
+
+    if !challenge.username.eq_ignore_ascii_case(&username) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(VerifyChallengeResponse {
+                success: false,
+                token: None,
+                username,
+                message: "Challenge username mismatch".into(),
+            }),
+        );
+    }
+
+    if Instant::now().duration_since(challenge.created_at).as_secs() > 60 {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(VerifyChallengeResponse {
+                success: false,
+                token: None,
+                username,
+                message: "Challenge has expired (60s limit)".into(),
+            }),
+        );
+    }
+
+    let client_bytes = match BASE64.decode(payload.response.trim()) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(VerifyChallengeResponse {
+                    success: false,
+                    token: None,
+                    username,
+                    message: "Invalid base64 in challenge response".into(),
+                }),
+            );
+        }
+    };
+
+    if client_bytes.len() != challenge.expected_response.len()
+        || !bool::from(client_bytes.as_slice().ct_eq(challenge.expected_response.as_slice()))
+    {
+        tracing::warn!("Cryptographic challenge failed for user {}", username);
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(VerifyChallengeResponse {
+                success: false,
+                token: None,
+                username,
+                message: "Cryptographic signature verification failed".into(),
+            }),
+        );
+    }
+
+    let token = Uuid::new_v4().to_string();
+    let mut sessions = state.sessions.lock().await;
+    sessions.insert(
+        token.clone(),
+        ActiveSession {
+            username: username.clone(),
+            created_at: chrono::Utc::now(),
+        },
+    );
+
+    tracing::info!("User '{}' authenticated via challenge-response. Token issued.", username);
+
+    (
+        StatusCode::OK,
+        Json(VerifyChallengeResponse {
+            success: true,
+            token: Some(token),
+            username,
+            message: "Authentication successful".into(),
+        }),
+    )
+}
+
 async fn register(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<RegisterRequest>,
 ) -> impl IntoResponse {
     let username = payload.username.trim().to_lowercase();
@@ -272,6 +593,7 @@ async fn register(
                 success: false,
                 message: "Username must be at least 3 characters".into(),
                 user: None,
+                token: None,
             }),
         );
     }
@@ -286,14 +608,32 @@ async fn register(
                 success: false,
                 message: "Username can only contain letters, numbers, _ and -".into(),
                 user: None,
+                token: None,
             }),
         );
     }
 
     let mut users = state.users.lock().await;
-
     let existing_id = users.get(&username).map(|u| u.id.clone());
     let is_update = existing_id.is_some();
+
+    // If updating existing user keys, cryptographic authentication is strictly required
+    if is_update {
+        drop(users);
+        let authorized = verify_user_session(&state, &username, &headers, payload.token.as_deref()).await;
+        if !authorized {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(RegisterResponse {
+                    success: false,
+                    message: "Identity re-registration or key rotation requires cryptographic authentication.".into(),
+                    user: None,
+                    token: None,
+                }),
+            );
+        }
+        users = state.users.lock().await;
+    }
 
     let user = User {
         id: existing_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
@@ -304,8 +644,20 @@ async fn register(
         one_time_prekeys: vec![],
     };
 
-    users.insert(username, user.clone());
+    users.insert(username.clone(), user.clone());
     save_users(&users);
+    drop(users);
+
+    // Issue initial session token for user
+    let token = Uuid::new_v4().to_string();
+    let mut sessions = state.sessions.lock().await;
+    sessions.insert(
+        token.clone(),
+        ActiveSession {
+            username: username.clone(),
+            created_at: chrono::Utc::now(),
+        },
+    );
 
     if is_update {
         tracing::info!("User identity re-registered / key rotated: {}", user.username);
@@ -323,6 +675,7 @@ async fn register(
                 "Identity created successfully".into()
             },
             user: Some(user),
+            token: Some(token),
         }),
     )
 }
@@ -336,13 +689,19 @@ async fn login(
 
     match users.get(&username) {
         Some(user) => {
-            tracing::info!("User logged in: {}", user.username);
+            tracing::info!("User login query: {}", user.username);
+            let requires_challenge = user.public_key.is_some();
             (
                 StatusCode::OK,
                 Json(LoginResponse {
                     success: true,
-                    message: "Login successful".into(),
+                    message: if requires_challenge {
+                        "Identity found. Cryptographic challenge required.".into()
+                    } else {
+                        "Login successful".into()
+                    },
                     user: Some(user.clone()),
+                    requires_challenge,
                 }),
             )
         }
@@ -355,6 +714,7 @@ async fn login(
                     username
                 ),
                 user: None,
+                requires_challenge: false,
             }),
         ),
     }
@@ -389,9 +749,22 @@ async fn get_public_key(
 
 async fn upload_prekeys(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<UploadPrekeysRequest>,
 ) -> impl IntoResponse {
     let username = payload.username.trim().to_lowercase();
+
+    let authorized = verify_user_session(&state, &username, &headers, payload.token.as_deref()).await;
+    if !authorized {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(UploadPrekeysResponse {
+                success: false,
+                message: "Unauthorized: Prekey upload requires cryptographic session token".into(),
+            }),
+        );
+    }
+
     let mut users = state.users.lock().await;
 
     if let Some(user) = users.get_mut(&username) {
@@ -424,9 +797,22 @@ async fn upload_prekeys(
 
 async fn append_prekeys(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<AppendPrekeysRequest>,
 ) -> impl IntoResponse {
     let username = payload.username.trim().to_lowercase();
+
+    let authorized = verify_user_session(&state, &username, &headers, payload.token.as_deref()).await;
+    if !authorized {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(UploadPrekeysResponse {
+                success: false,
+                message: "Unauthorized: Prekey replenishment requires cryptographic session token".into(),
+            }),
+        );
+    }
+
     let mut users = state.users.lock().await;
 
     if let Some(user) = users.get_mut(&username) {
@@ -581,7 +967,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 Message::Text(text) => {
                     let text = text.to_string();
                     match serde_json::from_str::<ClientMsg>(&text) {
-                        Ok(ClientMsg::Auth { username }) => {
+                        Ok(ClientMsg::Auth { username, token }) => {
                             let username = username.trim().to_lowercase();
                             let users = recv_state.users.lock().await;
                             if !users.contains_key(&username) {
@@ -593,6 +979,26 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 continue;
                             }
                             drop(users);
+
+                            // Verify cryptographic session token
+                            let mut token_valid = false;
+                            if let Some(ref t) = token {
+                                let sessions = recv_state.sessions.lock().await;
+                                if let Some(session) = sessions.get(t) {
+                                    if session.username.eq_ignore_ascii_case(&username) {
+                                        token_valid = true;
+                                    }
+                                }
+                            }
+
+                            if !token_valid {
+                                let err = serde_json::json!({
+                                    "type": "auth_error",
+                                    "message": "Cryptographic authentication failed. Valid session token required."
+                                });
+                                let _ = tx.send(err.to_string());
+                                continue;
+                            }
 
                             {
                                 let mut conns = recv_state.connections.lock().await;
