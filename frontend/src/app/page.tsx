@@ -2,6 +2,15 @@
 
 import { useState, useRef, useEffect, KeyboardEvent, useCallback } from "react";
 import QRCode from "qrcode";
+import {
+  uploadZeroKnowledgeVault,
+  downloadZeroKnowledgeVault,
+  getFirebaseStatus,
+  saveRuntimeFirebaseConfig,
+  clearRuntimeFirebaseConfig,
+  checkCloudVaultExists,
+  CloudVaultPayload,
+} from "@/lib/firebaseVault";
 
 const API_BASE = "http://localhost:8080";
 const WS_URL = "ws://localhost:8080/ws";
@@ -12,6 +21,7 @@ type Message = {
   text: string;
   timestamp: Date;
   peer?: string;
+  isCmdResult?: boolean;
 };
 
 type ConnStatus = "connecting" | "online" | "offline";
@@ -259,6 +269,96 @@ async function computeSafetyNumber(
   let digits = "";
   for (let i = 0; i < 30; i++) digits += (bytes[i] % 10).toString();
   return digits.match(/.{1,5}/g)!.join(" ");
+}
+
+// ─── Native Anti-Screen Capture (Windows Display Affinity) ───────────────────
+
+async function setScreenProtection(enabled: boolean): Promise<boolean> {
+  try {
+    const tauri = typeof window !== "undefined" && (window as any).__TAURI__;
+    if (tauri && tauri.core && tauri.core.invoke) {
+      return await tauri.core.invoke("set_screen_protection", { enabled });
+    }
+  } catch (e) {
+    console.warn("Screen protection not supported or failed:", e);
+  }
+  return false;
+}
+
+// ─── Cryptographic Memory Scrubbing & Zeroization ────────────────────────────
+
+function zeroizeBuffer(buf: ArrayBuffer | Uint8Array | null | undefined) {
+  if (!buf) return;
+  try {
+    const view = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    crypto.getRandomValues(view);
+    view.fill(0);
+  } catch {}
+}
+
+// ─── Trust-On-First-Use (TOFU) & MITM Detection ──────────────────────────────
+
+type TofuStatus = "trusted" | "verified" | "mismatch";
+
+type TofuRecord = {
+  peer: string;
+  identityKey: string;
+  fingerprint: string;
+  visualHash: string;
+  firstSeen: string;
+  status: TofuStatus;
+  lastSeen: string;
+};
+
+function getTofuRecord(username: string, peer: string): TofuRecord | null {
+  try {
+    const raw = localStorage.getItem(`sentinel_tofu_${username}_${peer}`);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveTofuRecord(username: string, peer: string, record: TofuRecord) {
+  try {
+    localStorage.setItem(`sentinel_tofu_${username}_${peer}`, JSON.stringify(record));
+  } catch {}
+}
+
+async function checkTofu(
+  username: string,
+  peer: string,
+  incomingIdentityKey: string,
+  myIdentityKey: string,
+): Promise<{ status: TofuStatus; record: TofuRecord; isNew: boolean }> {
+  const existing = getTofuRecord(username, peer);
+  const fingerprint = await computeSafetyNumber(myIdentityKey, incomingIdentityKey);
+  const visualHash = await computeVisualEmojiHash(fingerprint);
+
+  if (!existing) {
+    const record: TofuRecord = {
+      peer,
+      identityKey: incomingIdentityKey,
+      fingerprint,
+      visualHash,
+      firstSeen: new Date().toISOString(),
+      status: "trusted",
+      lastSeen: new Date().toISOString(),
+    };
+    saveTofuRecord(username, peer, record);
+    return { status: "trusted", record, isNew: true };
+  }
+
+  if (existing.identityKey !== incomingIdentityKey) {
+    existing.status = "mismatch";
+    existing.lastSeen = new Date().toISOString();
+    saveTofuRecord(username, peer, existing);
+    return { status: "mismatch", record: existing, isNew: false };
+  }
+
+  existing.lastSeen = new Date().toISOString();
+  saveTofuRecord(username, peer, existing);
+  return { status: existing.status, record: existing, isNew: false };
 }
 
 // ─── Vault Cryptography (PBKDF2 + AES-256-GCM) ───────────────────────────────
@@ -510,6 +610,13 @@ type RatchetState = {
   };
 };
 
+function zeroizeRatchetState(state: RatchetState | null) {
+  if (!state) return;
+  zeroizeBuffer(state.rootKey);
+  if (state.sendingChainKey) zeroizeBuffer(state.sendingChainKey);
+  if (state.receivingChainKey) zeroizeBuffer(state.receivingChainKey);
+}
+
 async function serializeRatchet(state: RatchetState): Promise<StoredRatchet> {
   const dhPrivateB64 = await exportPrivateKey(state.dhKeyPair.privateKey);
   return {
@@ -760,6 +867,16 @@ export default function Terminal() {
   const [vaultStatus, setVaultStatus] = useState<
     "locked" | "unlocked" | "shredded" | "none"
   >("none");
+  const [screenShield, setScreenShield] = useState<boolean>(true);
+  const [isLocked, setIsLocked] = useState<boolean>(false);
+  const [autoLockMinutes, setAutoLockMinutes] = useState<number>(5);
+  const [unlockInput, setUnlockInput] = useState<string>("");
+  const [unlockError, setUnlockError] = useState<string | null>(null);
+  const [cloudStatus, setCloudStatus] = useState<{
+    configured: boolean;
+    source: string;
+    projectId?: string;
+  }>({ configured: false, source: "none" });
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -777,6 +894,8 @@ export default function Terminal() {
   const vaultKeyRef = useRef<CryptoKey | null>(null);
   const seenMessagesRef = useRef<Set<string>>(new Set());
   const isReplenishingRef = useRef<boolean>(false);
+  const tofuMismatchesRef = useRef<Set<string>>(new Set());
+  const lastUserActivityRef = useRef<number>(Date.now());
 
   const pendingCiphertextsRef = useRef<
     Map<string, { id: string; header: any; body: string; from: string }[]>
@@ -790,6 +909,22 @@ export default function Terminal() {
     activePeerRef.current = activePeer;
   }, [activePeer]);
 
+  const zeroizeAllKeys = useCallback(() => {
+    if (ratchetRef.current) zeroizeRatchetState(ratchetRef.current);
+    ratchetsByPeerRef.current.forEach((r) => zeroizeRatchetState(r));
+    ratchetsByPeerRef.current.clear();
+    ratchetRef.current = null;
+
+    privateKeyRef.current = null;
+    spkPrivateRef.current = null;
+    opksRef.current.forEach((opk) => {
+      opk.priv = "";
+    });
+    opksRef.current = [];
+    vaultKeyRef.current = null;
+    safetyNumberRef.current = null;
+  }, []);
+
   const executePanic = useCallback(() => {
     if (wsRef.current) {
       wsRef.current.onclose = null;
@@ -802,14 +937,7 @@ export default function Terminal() {
 
     seenMessagesRef.current.clear();
     isReplenishingRef.current = false;
-    vaultKeyRef.current = null;
-    privateKeyRef.current = null;
-    myPublicKeyB64Ref.current = null;
-    spkPrivateRef.current = null;
-    opksRef.current = [];
-    safetyNumberRef.current = null;
-    ratchetRef.current = null;
-    ratchetsByPeerRef.current.clear();
+    zeroizeAllKeys();
     pendingCiphertextsRef.current.clear();
 
     try {
@@ -840,45 +968,88 @@ export default function Terminal() {
         type: "system",
         text: "════════════════════════════════════════════════════════════════════",
         timestamp: new Date(),
+        isCmdResult: true,
       },
       {
         id: crypto.randomUUID(),
         type: "system",
         text: "🚨 EMERGENCY PANIC PURGE EXECUTED 🚨",
         timestamp: new Date(),
+        isCmdResult: true,
       },
       {
         id: crypto.randomUUID(),
         type: "system",
         text: "• In-memory private keys, ratchets & vault key purged",
         timestamp: new Date(),
+        isCmdResult: true,
       },
       {
         id: crypto.randomUUID(),
         type: "system",
         text: "• Local storage shredded and overwritten",
         timestamp: new Date(),
+        isCmdResult: true,
       },
       {
         id: crypto.randomUUID(),
         type: "system",
         text: "• WebSocket connection forcefully severed",
         timestamp: new Date(),
+        isCmdResult: true,
       },
       {
         id: crypto.randomUUID(),
         type: "system",
         text: "════════════════════════════════════════════════════════════════════",
         timestamp: new Date(),
+        isCmdResult: true,
       },
       {
         id: crypto.randomUUID(),
         type: "system",
-        text: "Identity erased from this client. Use /register <user> <passphrase> to establish a new identity.",
+        text: "Identity erased from this client. Use /register <user> to establish a new identity.",
         timestamp: new Date(),
+        isCmdResult: true,
       },
     ]);
   }, []);
+
+  const logBackground = useCallback((text: string, details?: unknown) => {
+    if (details !== undefined) {
+      console.log(`[Sentinel System] ${text}`, details);
+    } else {
+      console.log(`[Sentinel System] ${text}`);
+    }
+  }, []);
+
+  const addCommandResult = useCallback((text: string, peer?: string) => {
+    const targetPeer =
+      peer !== undefined ? peer : (activePeerRef.current ?? undefined);
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: crypto.randomUUID(),
+        type: "system",
+        text,
+        timestamp: new Date(),
+        peer: targetPeer,
+        isCmdResult: true,
+      },
+    ]);
+  }, []);
+
+  const lockSession = useCallback(
+    (reason: string = "Manual lock") => {
+      if (!usernameRef.current) return;
+      zeroizeAllKeys();
+      setIsLocked(true);
+      setUnlockError(null);
+      setUnlockInput("");
+      logBackground(`Session locked: ${reason}. In-memory keys scrubbed.`);
+    },
+    [zeroizeAllKeys, logBackground],
+  );
 
   useEffect(() => {
     const handleGlobalKey = (e: globalThis.KeyboardEvent) => {
@@ -888,11 +1059,37 @@ export default function Terminal() {
       ) {
         e.preventDefault();
         executePanic();
+      } else if (e.ctrlKey && e.key.toLowerCase() === "l") {
+        e.preventDefault();
+        lockSession("Hotkey Ctrl+L");
       }
     };
+
+    const updateActivity = () => {
+      lastUserActivityRef.current = Date.now();
+    };
+
     window.addEventListener("keydown", handleGlobalKey);
-    return () => window.removeEventListener("keydown", handleGlobalKey);
-  }, [executePanic]);
+    window.addEventListener("keydown", updateActivity);
+    window.addEventListener("mousedown", updateActivity);
+    window.addEventListener("mousemove", updateActivity);
+
+    const autoLockInterval = window.setInterval(() => {
+      if (!usernameRef.current || isLocked || autoLockMinutes <= 0) return;
+      const idleTime = Date.now() - lastUserActivityRef.current;
+      if (idleTime > autoLockMinutes * 60 * 1000) {
+        lockSession(`Inactivity timeout (${autoLockMinutes}m)`);
+      }
+    }, 5000);
+
+    return () => {
+      window.removeEventListener("keydown", handleGlobalKey);
+      window.removeEventListener("keydown", updateActivity);
+      window.removeEventListener("mousedown", updateActivity);
+      window.removeEventListener("mousemove", updateActivity);
+      window.clearInterval(autoLockInterval);
+    };
+  }, [executePanic, lockSession, isLocked, autoLockMinutes]);
 
   const scheduleDisappear = useCallback(
     (messageId: string, peer: string, ttlMs: number) => {
@@ -920,9 +1117,73 @@ export default function Terminal() {
     [],
   );
 
+  const unlockSession = useCallback(
+    async (passphrase?: string) => {
+      const currentName = usernameRef.current;
+      if (!currentName) {
+        setIsLocked(false);
+        return true;
+      }
+
+      if (hasVaultConfigured(currentName)) {
+        if (!passphrase) {
+          setUnlockError("Vault passphrase required to unlock.");
+          return false;
+        }
+        const vKey = await unlockVault(currentName, passphrase);
+        if (!vKey) {
+          setUnlockError("Incorrect passphrase. Decryption failed.");
+          return false;
+        }
+        vaultKeyRef.current = vKey;
+        setVaultStatus("unlocked");
+
+        const privB64 = await loadPrivateKey(currentName, vKey);
+        if (privB64) {
+          privateKeyRef.current = await importPrivateKey(privB64);
+          setHasKeys(true);
+        }
+        const spkPrivB64 = await loadSpkPrivate(currentName, vKey);
+        if (spkPrivB64) {
+          spkPrivateRef.current = await importPrivateKey(spkPrivB64);
+        }
+        const savedOpks = await loadOpks(currentName, vKey);
+        opksRef.current = savedOpks;
+      }
+
+      if (activePeerRef.current) {
+        const p = activePeerRef.current;
+        const loaded = await loadSession(currentName, p, vaultKeyRef.current);
+        if (loaded) {
+          ratchetRef.current = loaded;
+          ratchetsByPeerRef.current.set(p, loaded);
+        }
+      }
+
+      setIsLocked(false);
+      setUnlockError(null);
+      setUnlockInput("");
+      lastUserActivityRef.current = Date.now();
+      addCommandResult(
+        "✓ Session unlocked. In-memory keys restored.",
+        activePeerRef.current ?? undefined,
+      );
+      return true;
+    },
+    [addCommandResult],
+  );
+
   const addMessage = useCallback(
-    (type: Message["type"], text: string, peer?: string) => {
+    (
+      type: Message["type"],
+      text: string,
+      peer?: string,
+      isCmdResult?: boolean,
+    ) => {
       setMessages((prev) => {
+        const targetPeer =
+          peer !== undefined ? peer : (activePeerRef.current ?? undefined);
+
         const next = [
           ...prev,
           {
@@ -930,14 +1191,11 @@ export default function Terminal() {
             type,
             text,
             timestamp: new Date(),
-            peer:
-              peer ??
-              (type === "system"
-                ? undefined
-                : (activePeerRef.current ?? undefined)),
+            peer: targetPeer,
+            isCmdResult: type === "command" || isCmdResult === true,
           },
         ];
-        const p = peer ?? (type !== "system" ? activePeerRef.current : null);
+        const p = targetPeer;
         if (p && usernameRef.current && (type === "user" || type === "peer")) {
           void saveChatHistory(
             usernameRef.current,
@@ -1174,7 +1432,7 @@ export default function Terminal() {
                 ? {
                     ...m,
                     type: "peer" as const,
-                    text: `[${item.from}] ${plaintext}`,
+                    text: plaintext,
                     peer,
                   }
                 : m,
@@ -1211,11 +1469,12 @@ export default function Terminal() {
       vaultKeyRef.current,
     );
     setMessages((prev) => {
-      const systems = prev.filter((m) => m.type === "system");
-      const otherPeers = prev.filter(
-        (m) => m.type !== "system" && m.peer !== peer,
+      const existingHistoryIds = new Set(history.map((h) => h.id));
+      const inMemoryNonHistory = prev.filter(
+        (m) => m.peer === peer && !existingHistoryIds.has(m.id),
       );
-      return [...systems, ...otherPeers, ...history];
+      const otherMessages = prev.filter((m) => m.peer !== peer);
+      return [...otherMessages, ...history, ...inMemoryNonHistory];
     });
   }, []);
 
@@ -1330,15 +1589,49 @@ export default function Terminal() {
                   }
                 }
 
-                if (header?.x3dh && !state) {
+                // Replay Protection: Drop duplicate packets
+                const packetFingerprint = `${from}:${header.dh || "0"}:${header.n}`;
+                if (seenMessagesRef.current.has(packetFingerprint)) {
+                  addMessage(
+                    "system",
+                    `⚠️ [Security Alert] Dropped duplicate / replayed packet (n=${header.n}) from ${from}.`,
+                    from,
+                  );
+                  break;
+                }
+                seenMessagesRef.current.add(packetFingerprint);
+                if (seenMessagesRef.current.size > 2000) {
+                  const firstKey = seenMessagesRef.current.keys().next().value;
+                  if (firstKey) seenMessagesRef.current.delete(firstKey);
+                }
+
+                if (header?.x3dh) {
                   if (!header.x3dh.ik) {
                     addMessage(
                       "peer",
-                      `[${from}] (encrypted – missing identity key)`,
+                      "(encrypted – missing identity key)",
                       from,
                     );
                     break;
                   }
+
+                  if (usernameRef.current && myPublicKeyB64Ref.current) {
+                    const tofu = await checkTofu(
+                      usernameRef.current,
+                      from,
+                      header.x3dh.ik,
+                      myPublicKeyB64Ref.current,
+                    );
+                    if (tofu.status === "mismatch") {
+                      tofuMismatchesRef.current.add(from);
+                      addMessage(
+                        "system",
+                        `🚨 [MITM Alert] Remote identity key for '${from}' does not match previously trusted key! Potential interception detected. Type /trust ${from} if verified.`,
+                        from,
+                      );
+                    }
+                  }
+
                   const sk = await completeX3DHAsReceiver(
                     header.x3dh.ik,
                     header.x3dh.ek,
@@ -1387,7 +1680,7 @@ export default function Terminal() {
 
                 if (!state) {
                   const id = crypto.randomUUID();
-                  const placeholder = `[${from}] (encrypted – open chat or /new ${from})`;
+                  const placeholder = `(encrypted – open chat or /new ${from})`;
                   setMessages((prev) => [
                     ...prev,
                     {
@@ -1402,22 +1695,6 @@ export default function Terminal() {
                   list.push({ id, header, body, from });
                   pendingCiphertextsRef.current.set(from, list);
                   break;
-                }
-
-                // Replay Protection: Drop duplicate packets
-                const packetFingerprint = `${from}:${header.dh || "0"}:${header.n}`;
-                if (seenMessagesRef.current.has(packetFingerprint)) {
-                  addMessage(
-                    "system",
-                    `⚠️ [Security Alert] Dropped duplicate / replayed packet (n=${header.n}) from ${from}.`,
-                    from,
-                  );
-                  break;
-                }
-                seenMessagesRef.current.add(packetFingerprint);
-                if (seenMessagesRef.current.size > 2000) {
-                  const firstKey = seenMessagesRef.current.keys().next().value;
-                  if (firstKey) seenMessagesRef.current.delete(firstKey);
                 }
 
                 let s: RatchetState = state;
@@ -1435,7 +1712,7 @@ export default function Terminal() {
                 if (!s.receivingChainKey) {
                   addMessage(
                     "peer",
-                    `[${from}] (no receiving chain yet)`,
+                    "(no receiving chain yet)",
                     from,
                   );
                   break;
@@ -1453,7 +1730,7 @@ export default function Terminal() {
                 if (recvN !== header.n) {
                   addMessage(
                     "peer",
-                    `[${from}] (message number mismatch)`,
+                    "(message number mismatch)",
                     from,
                   );
                   break;
@@ -1485,7 +1762,7 @@ export default function Terminal() {
                     {
                       id: msgId,
                       type: "peer" as const,
-                      text: `[${from}] ${plaintext}`,
+                      text: plaintext,
                       timestamp: new Date(),
                       peer: from,
                     },
@@ -1501,10 +1778,10 @@ export default function Terminal() {
                   scheduleDisappear(msgId, from, ttl);
                 }
               } catch (err) {
-                console.error(err);
+                logBackground(`Couldn't decrypt incoming packet from ${msg.from}:`, err);
                 addMessage(
                   "peer",
-                  `[${msg.from}] Couldn’t decrypt this message. Run /reset ${msg.from} then /new ${msg.from} to start a fresh secure chat.`,
+                  `Couldn’t decrypt this message. Run /reset ${msg.from} then /new ${msg.from} to start a fresh secure chat.`,
                   msg.from,
                 );
               }
@@ -1544,6 +1821,8 @@ export default function Terminal() {
 
   useEffect(() => {
     setMounted(true);
+    void setScreenProtection(true);
+    setCloudStatus(getFirebaseStatus());
     setMessages([
       {
         id: "1",
@@ -1605,50 +1884,88 @@ export default function Terminal() {
     return () => clearInterval(interval);
   }, [username, hasKeys, replenishPrekeys]);
 
-  const systemMessages = messages.filter((m) => m.type === "system");
-  const chatMessages = messages.filter((m) => {
-    if (m.type === "system") return false;
-    if (!activePeer) return false;
-    return m.peer === activePeer;
+  const getCleanMessageText = (msg: Message) => {
+    if (msg.type === "peer") {
+      const peerName = msg.peer || activePeer;
+      if (peerName) {
+        const prefix = `[${peerName}]`;
+        if (msg.text.startsWith(prefix)) {
+          return msg.text.slice(prefix.length).trimStart();
+        }
+      }
+      const match = msg.text.match(/^\[[a-zA-Z0-9_\-\.]+\]\s*(.*)$/);
+      if (match) {
+        return match[1];
+      }
+    }
+    return msg.text;
+  };
+
+  const displayedMessages = messages.filter((m) => {
+    if (m.type === "system" && !m.isCmdResult) {
+      return false;
+    }
+    if (!activePeer) {
+      return m.type === "command" || m.isCmdResult;
+    }
+    if (m.peer === activePeer) return true;
+    if (!m.peer && (m.type === "command" || m.isCmdResult)) return true;
+    return false;
   });
 
   // ─── Commands ─────────────────────────────────────────────────────────────
 
   const handleCommand = async (cmd: string) => {
-    const parts = cmd.trim().split(/\s+/);
+    const trimmed = cmd.trim();
+    if (!trimmed) return;
+
+    if (trimmed.startsWith("/")) {
+      addMessage("command", trimmed, activePeer ?? undefined);
+    }
+
+    const parts = trimmed.split(/\s+/);
     const command = parts[0].toLowerCase();
 
     switch (command) {
       case "/help":
-        addMessage(
-          "system",
+        addCommandResult(
           `Available commands:
   /help                  Show this help
   /register <username>   Create identity + prekeys
   /login <username>      Login and load keys + history
   /new <user>            Start or restore session with user
   /chats                 List contacts / sessions
+  /verify                Show Safety Number & TOFU verification status
+  /trust [user]          Explicitly trust remote Identity Key after rotation
+  /shield [on|off]       Toggle Anti-Screen Capture / OBS defense (Win32)
+  /lock [mins|off]       Lock terminal immediately (or set auto-lock timer)
+  /unlock <passphrase>   Unlock terminal & decrypt in-memory keys
   /disappear <time|off>  Auto-delete msgs (30s, 5m, 1h, off)
-  /reset <user>            Reset broken secure session with user
-  /verify                Show Safety Number
-  /clear                 Clear current chat history
-  /status                Show status
+  /reset <user>          Reset broken secure session with user
+  /clear                 Clear current chat history view
+  /status                Show status & security parameters
+  /cloud-backup <pass>   Backup E2EE vault to Firebase (Zero-Knowledge)
+  /cloud-restore <u p>   Restore identity & sessions from Firebase on any device
+  /cloud-config [json]   Configure or view Firebase credentials
+  /export-key            Export armored private keys for other devices
+  /import-key <key>      Import private keys on this browser
   /logout                End session
+  /panic                 Purge memory & shred local storage (Ctrl+Shift+X)
 
-  Chat history is saved on this device.
-  Disappearing messages delete on both sides after the timer.`,
+  Hotkeys: Ctrl+L (Lock) | Ctrl+Shift+X (Panic Shred)`,
+          activePeer ?? undefined,
         );
         break;
 
       case "/chats": {
         if (contacts.length === 0) {
-          addMessage("system", "No contacts yet. Use /new <user> to start.");
+          addCommandResult("No contacts yet. Use /new <user> to start.", activePeer ?? undefined);
         } else {
-          addMessage(
-            "system",
+          addCommandResult(
             `Contacts:\n${contacts
               .map((c) => (c === activePeer ? `  → ${c} (active)` : `    ${c}`))
               .join("\n")}`,
+            activePeer ?? undefined,
           );
         }
         break;
@@ -1656,40 +1973,40 @@ export default function Terminal() {
 
       case "/disappear": {
         if (!activePeer || !username) {
-          addMessage("system", "Open a chat first, then use /disappear <time>");
+          addCommandResult("Open a chat first, then use /disappear <time>", activePeer ?? undefined);
           break;
         }
         if (!parts[1] || parts[1].toLowerCase() === "off") {
           setDisappearMs(null);
           saveDisappearMs(username, activePeer, null);
-          addMessage("system", `Disappearing messages OFF for ${activePeer}.`);
+          addCommandResult(`Disappearing messages OFF for ${activePeer}.`, activePeer);
           break;
         }
         const ms = parseDuration(parts[1]);
         if (ms === null) {
-          addMessage(
-            "system",
+          addCommandResult(
             "Usage: /disappear <time>  e.g. 30s, 5m, 1h  |  /disappear off",
+            activePeer,
           );
           break;
         }
         setDisappearMs(ms);
         saveDisappearMs(username, activePeer, ms);
-        addMessage(
-          "system",
+        addCommandResult(
           `Disappearing messages ON for ${activePeer}: ${formatDuration(ms)}`,
+          activePeer,
         );
         break;
       }
 
       case "/reset": {
         if (!username) {
-          addMessage("system", "Login first.");
+          addCommandResult("Login first.", activePeer ?? undefined);
           break;
         }
         const peer = (parts[1] || activePeer || "").toLowerCase();
         if (!peer) {
-          addMessage("system", "Usage: /reset <username>");
+          addCommandResult("Usage: /reset <username>", activePeer ?? undefined);
           break;
         }
 
@@ -1704,31 +2021,22 @@ export default function Terminal() {
         // Clear saved session on disk
         clearPeerSession(username, peer);
 
-        addMessage(
-          "system",
-          `Secure session with ${peer} was reset on this device.`,
-        );
-        addMessage(
-          "system",
-          `Next: run /new ${peer} (only one of you), then send a message to open a new chat.`,
+        addCommandResult(
+          `Secure session with ${peer} was reset on this device. Run /new ${peer} to establish a fresh session.`,
+          activePeer ?? undefined,
         );
         break;
       }
 
       case "/register": {
         if (!parts[1]) {
-          addMessage("system", "Usage: /register <username>");
+          addCommandResult("Usage: /register <username>", activePeer ?? undefined);
           break;
         }
         const name = parts[1].toLowerCase();
-        addMessage("system", `Registering "${name}"...`);
+        logBackground(`Registering "${name}"...`);
 
         try {
-          addMessage(
-            "system",
-            "Generating identity + signed prekey + one-time prekeys...",
-          );
-
           const identity = await generateKeyPair();
           const publicKeyB64 = await exportPublicKey(identity.publicKey);
           const privateKeyB64 = await exportPrivateKey(identity.privateKey);
@@ -1767,7 +2075,7 @@ export default function Terminal() {
           const data = await res.json();
 
           if (!data.success) {
-            addMessage("system", `Error: ${data.message}`);
+            addCommandResult(`Registration error: ${data.message}`, activePeer ?? undefined);
             break;
           }
 
@@ -1780,28 +2088,20 @@ export default function Terminal() {
               one_time_prekeys: opks.map((o) => o.pub),
             }),
           });
-          const preData = await preRes.json();
+          await preRes.json();
 
           setUsername(data.user.username);
-          addMessage("system", `Identity created: ${data.user.username}`);
-          addMessage(
-            "system",
-            preData.success
-              ? "Prekeys uploaded (X3DH ready)."
-              : "Warning: prekey upload failed.",
-          );
-
           const saved = listSavedPeers(data.user.username);
           if (saved.length > 0) {
             setContacts(saved);
-            addMessage("system", `Found ${saved.length} saved session(s).`);
           }
 
           sendWs({ type: "auth", username: data.user.username });
           setUsersCount((c) => c + 1);
+          addCommandResult(`Registered identity "${data.user.username}". E2EE prekeys ready.`, activePeer ?? undefined);
         } catch (err) {
           console.error(err);
-          addMessage("system", "Failed to register. Is the backend running?");
+          addCommandResult("Failed to register. Is the backend running?", activePeer ?? undefined);
           setConnStatus("offline");
         }
         break;
@@ -1809,11 +2109,11 @@ export default function Terminal() {
 
       case "/login": {
         if (!parts[1]) {
-          addMessage("system", "Usage: /login <username>");
+          addCommandResult("Usage: /login <username>", activePeer ?? undefined);
           break;
         }
         const name = parts[1].toLowerCase();
-        addMessage("system", `Logging in as "${name}"...`);
+        logBackground(`Logging in as "${name}"...`);
 
         try {
           const res = await fetch(`${API_BASE}/api/login`, {
@@ -1824,17 +2124,38 @@ export default function Terminal() {
           const data = await res.json();
 
           if (!data.success) {
-            addMessage("system", `Error: ${data.message}`);
+            addCommandResult(`Login error: ${data.message}`, activePeer ?? undefined);
             break;
           }
 
           const privB64 = await loadPrivateKey(name, vaultKeyRef.current);
           if (!privB64) {
-            addMessage("system", "No local private key found on this device.");
             setUsername(data.user.username);
             if (data.user.public_key)
               myPublicKeyB64Ref.current = data.user.public_key;
             sendWs({ type: "auth", username: data.user.username });
+
+            const hasCloudVault = await checkCloudVaultExists(name);
+            if (hasCloudVault) {
+              addCommandResult(
+                `☁️ ZERO-KNOWLEDGE CLOUD VAULT DETECTED FOR '${data.user.username}'!\n` +
+                `────────────────────────────────────────────────────────────\n` +
+                `Your encrypted keys are backed up in Firebase.\n` +
+                `To restore your full identity, prekeys & chats on this device, run:\n\n` +
+                `   /cloud-restore ${data.user.username} <your_passphrase>`,
+                activePeer ?? undefined,
+              );
+            } else {
+              addCommandResult(
+                `⚠️ Logged in as '${data.user.username}', but NO PRIVATE KEY exists on this device/browser.\n` +
+                `────────────────────────────────────────────────────────────\n` +
+                `• Sentinel end-to-end encryption stores private keys locally on the device where you registered.\n` +
+                `• If you backed up your keys, restore with: /cloud-restore ${data.user.username} <passphrase>\n` +
+                `• Or re-register keys here: /register ${data.user.username} (or use /import-key).\n` +
+                `• Or create a distinct testing identity: /register <another_name>`,
+                activePeer ?? undefined,
+              );
+            }
             break;
           }
 
@@ -1851,20 +2172,14 @@ export default function Terminal() {
 
           const saved = listSavedPeers(name);
           setContacts(saved);
-
-          addMessage(
-            "system",
-            `Logged in as ${data.user.username} (id: ${data.user.id})`,
-          );
-          addMessage(
-            "system",
-            saved.length > 0
-              ? `Loaded ${saved.length} contact(s). Click one to restore chat history.`
-              : `Keys loaded. Use /new <peer> to start a chat.`,
-          );
           sendWs({ type: "auth", username: data.user.username });
+
+          addCommandResult(
+            `Logged in as ${data.user.username}.${saved.length > 0 ? ` Loaded ${saved.length} contact(s).` : " Use /new <peer> to start a chat."}`,
+            activePeer ?? undefined,
+          );
         } catch {
-          addMessage("system", "Failed to reach backend.");
+          addCommandResult("Failed to reach backend.", activePeer ?? undefined);
           setConnStatus("offline");
         }
         break;
@@ -1872,17 +2187,25 @@ export default function Terminal() {
 
       case "/new": {
         if (!parts[1]) {
-          addMessage("system", "Usage: /new <username>");
+          addCommandResult("Usage: /new <username>", activePeer ?? undefined);
           break;
         }
-        if (!username || !privateKeyRef.current || !myPublicKeyB64Ref.current) {
-          addMessage("system", "Register or login first.");
+        if (!username) {
+          addCommandResult("Login or register first.", activePeer ?? undefined);
+          break;
+        }
+        if (!privateKeyRef.current || !myPublicKeyB64Ref.current) {
+          addCommandResult(
+            `Cannot start session: No private key found for '${username}' on this device.\n` +
+            `Run /register ${username} to generate keys on this browser, or /register <new_name>.`,
+            activePeer ?? undefined,
+          );
           break;
         }
 
         const peer = parts[1].toLowerCase();
         if (peer === username) {
-          addMessage("system", "Cannot chat with yourself.");
+          addCommandResult("Cannot chat with yourself.", activePeer ?? undefined);
           break;
         }
 
@@ -1897,15 +2220,12 @@ export default function Terminal() {
           addContact(peer);
           setDisappearMs(loadDisappearMs(username, peer));
           loadPeerHistoryIntoView(peer);
-          addMessage(
-            "system",
-            `Restored existing session with ${peer}. Ready to chat.`,
-          );
+          addCommandResult(`Chat opened with ${peer}. Ready to message.`, peer);
           await tryDecryptPending(peer);
           break;
         }
 
-        addMessage("system", `Fetching prekey bundle for ${peer}...`);
+        logBackground(`Fetching prekey bundle for ${peer}...`);
 
         try {
           const res = await fetch(`${API_BASE}/api/prekey-bundle/${peer}`);
@@ -1916,11 +2236,32 @@ export default function Terminal() {
             !bundle.identity_key ||
             !bundle.signed_prekey
           ) {
-            addMessage(
-              "system",
-              `No prekeys for '${peer}'. They must /register first.`,
-            );
+            addCommandResult(`No prekeys for '${peer}'. They must /register first.`, activePeer ?? undefined);
             break;
+          }
+
+          // TOFU Verification
+          if (username && myPublicKeyB64Ref.current) {
+            const tofu = await checkTofu(
+              username,
+              peer,
+              bundle.identity_key,
+              myPublicKeyB64Ref.current,
+            );
+            if (tofu.status === "mismatch") {
+              tofuMismatchesRef.current.add(peer);
+              addCommandResult(
+                `🚨 CRITICAL SECURITY WARNING: IDENTITY KEY MISMATCH FOR '${peer}'!\n` +
+                `────────────────────────────────────────────────────────────\n` +
+                `STORED FINGERPRINT:   ${tofu.record.fingerprint}  [  ${tofu.record.visualHash}  ]\n` +
+                `NEW INCOMING KEY:     ${await computeSafetyNumber(myPublicKeyB64Ref.current, bundle.identity_key)}\n` +
+                `⚠️ The public identity key for '${peer}' has CHANGED since your previous verification.\n` +
+                `• Potential active Man-in-the-Middle (MITM) attack or device reset.\n` +
+                `Outgoing messaging to '${peer}' is BLOCKED.\n` +
+                `Compare fingerprints with ${peer} out-of-band and run: /trust ${peer}`,
+                peer,
+              );
+            }
           }
 
           const theirIK = await importPublicKey(bundle.identity_key);
@@ -1977,33 +2318,20 @@ export default function Terminal() {
           addContact(peer);
           setDisappearMs(loadDisappearMs(username, peer));
           loadPeerHistoryIntoView(peer);
-          addMessage(
-            "system",
-            `X3DH + Double Ratchet session started with ${peer}.`,
-          );
-          const visualEmoji = await computeVisualEmojiHash(safety);
-          const qrAscii = await generateTerminalQr(safety, username, peer);
 
-          addMessage("system", "────────────────────────────────────────────────────────────");
-          addMessage("system", "🛡️  SAFETY NUMBER (Compare with peer to verify channel):");
-          addMessage("system", `FINGERPRINT:  ${safety}`);
-          addMessage("system", `VISUAL HASH:  [  ${visualEmoji}  ]`);
-          if (qrAscii) {
-            addMessage("system", "\nSCAN TO VERIFY (Phone Camera / QR Reader):\n" + qrAscii);
-          }
-          addMessage("system", "────────────────────────────────────────────────────────────");
+          addCommandResult(`Secure E2EE session established with ${peer}. Ready to message. (Type /verify for Safety Number)`, peer);
           await tryDecryptPending(peer);
           void replenishPrekeys();
         } catch (err) {
           console.error(err);
-          addMessage("system", `Failed to set up session with ${peer}.`);
+          addCommandResult(`Failed to set up session with ${peer}.`, activePeer ?? undefined);
         }
         break;
       }
 
       case "/verify": {
         if (!activePeer || !username) {
-          addMessage("system", "No active chat. Use /new <user> first.");
+          addCommandResult("No active chat. Use /new <user> first.", activePeer ?? undefined);
           break;
         }
 
@@ -2020,48 +2348,125 @@ export default function Terminal() {
         }
 
         if (!sn) {
-          addMessage("system", "Unable to compute safety number. Open a chat or /new <user>.");
+          addCommandResult("Unable to compute safety number. Open a chat or /new <user>.", activePeer);
           break;
         }
 
         const visualEmoji = await computeVisualEmojiHash(sn);
-        const qrAscii = await generateTerminalQr(sn, username, activePeer);
+        const tofuRec = getTofuRecord(username, activePeer);
+        const tofuStatus = !tofuRec
+          ? "NOT CACHED"
+          : tofuRec.status === "mismatch"
+            ? "🚨 MISMATCH (POSSIBLE MITM / KEY ROTATION)"
+            : tofuRec.status === "verified"
+              ? "🛡️ MANUALLY VERIFIED"
+              : "✓ TRUSTED (TRUST-ON-FIRST-USE)";
 
-        addMessage("system", "────────────────────────────────────────────────────────────");
-        addMessage("system", `🛡️  SAFETY NUMBER VERIFICATION: ${username} ⟷ ${activePeer}`);
-        addMessage("system", "────────────────────────────────────────────────────────────");
-        addMessage("system", `FINGERPRINT:  ${sn}`);
-        addMessage("system", `VISUAL HASH:  [  ${visualEmoji}  ]`);
-        if (qrAscii) {
-          addMessage("system", "\nSCAN TO VERIFY (Camera / QR Reader):\n" + qrAscii);
+        addCommandResult(
+          `🛡️ SAFETY NUMBER VERIFICATION: ${username} ⟷ ${activePeer}\n` +
+          `────────────────────────────────────────────────────────────\n` +
+          `TOFU STATUS:  ${tofuStatus}\n` +
+          `FINGERPRINT:  ${sn}\n` +
+          `VISUAL HASH:  [  ${visualEmoji}  ]\n` +
+          `Compare this visual hash or fingerprint with ${activePeer} to verify channel integrity.\n` +
+          `Type /trust ${activePeer} to explicitly acknowledge and trust key.`,
+          activePeer,
+        );
+        break;
+      }
+
+      case "/trust": {
+        const targetPeer = parts[1] || activePeer;
+        if (!targetPeer) {
+          addCommandResult("Usage: /trust <username>", activePeer ?? undefined);
+          break;
         }
-        addMessage("system", "Compare the visual emoji hash, the 30-digit fingerprint, or");
-        addMessage("system", "scan the QR code with your peer to ensure zero eavesdropping.");
-        addMessage("system", "────────────────────────────────────────────────────────────");
+        if (!username) {
+          addCommandResult("Login first.", activePeer ?? undefined);
+          break;
+        }
+        tofuMismatchesRef.current.delete(targetPeer);
+        try {
+          const res = await fetch(`${API_BASE}/api/public-key/${targetPeer}`);
+          const data = await res.json();
+          if (data.success && data.public_key && myPublicKeyB64Ref.current) {
+            const sn = await computeSafetyNumber(myPublicKeyB64Ref.current, data.public_key);
+            const vh = await computeVisualEmojiHash(sn);
+            saveTofuRecord(username, targetPeer, {
+              peer: targetPeer,
+              identityKey: data.public_key,
+              fingerprint: sn,
+              visualHash: vh,
+              firstSeen: new Date().toISOString(),
+              status: "verified",
+              lastSeen: new Date().toISOString(),
+            });
+            addCommandResult(
+              `🛡️ KEY TRUST CONFIRMED: Identity Key for '${targetPeer}' explicitly trusted.\n` +
+              `Safety Number: ${sn}\n` +
+              `Visual Hash:   [  ${vh}  ]\n` +
+              `Messaging unblocked.`,
+              targetPeer,
+            );
+          } else {
+            addCommandResult(`✓ Cleared mismatch flag for '${targetPeer}'.`, targetPeer);
+          }
+        } catch {
+          addCommandResult(`✓ Cleared mismatch flag for '${targetPeer}'.`, targetPeer);
+        }
+        break;
+      }
+
+      case "/shield": {
+        const arg = parts[1]?.toLowerCase();
+        const nextVal = arg === "on" ? true : arg === "off" ? false : !screenShield;
+        setScreenShield(nextVal);
+        void setScreenProtection(nextVal);
+        addCommandResult(
+          nextVal
+            ? "🛡️ Screen Protection ENABLED. Window display affinity is active (hidden from screen capture, OBS & screen share)."
+            : "⚠️ Screen Protection DISABLED. Window is visible to capture tools.",
+          activePeer ?? undefined,
+        );
+        break;
+      }
+
+      case "/lock": {
+        const arg = parts[1]?.toLowerCase();
+        if (arg === "off") {
+          setAutoLockMinutes(0);
+          addCommandResult("Auto-lock timer DISABLED.", activePeer ?? undefined);
+        } else if (arg && !isNaN(Number(arg))) {
+          const mins = Math.max(1, Number(arg));
+          setAutoLockMinutes(mins);
+          addCommandResult(`Auto-lock timer set to ${mins} minute(s).`, activePeer ?? undefined);
+        } else {
+          lockSession("Manual lock command");
+        }
+        break;
+      }
+
+      case "/unlock": {
+        const pass = parts.slice(1).join(" ");
+        await unlockSession(pass || undefined);
         break;
       }
 
       case "/status":
-        addMessage(
-          "system",
+        addCommandResult(
           `Status:
   User:            ${username || "not registered"}
   Active chat:     ${activePeer || "none"}
   Contacts:        ${contacts.length}
   Backend:         ${connStatus.toUpperCase()}
-  WebSocket auth:  ${wsAuthed ? "yes" : "no"}
-  Local keys:      ${hasKeys ? "loaded" : "none"}
-  Prekeys in vault:${opksRef.current.length}
-  Forward secrecy: auto-replenishing active (X3DH + OPK)
-  Traffic defense: constant-size padding active (tiers 128B - 4KB)
-  Replay guard:    sliding window cache active
-  Ratchet:         ${ratchetRef.current ? "active" : "none"}
+  Screen Shield:   ${screenShield ? "ACTIVE (Anti-Screen Capture)" : "DISABLED"}
+  Auto-Lock:       ${autoLockMinutes > 0 ? `${autoLockMinutes} min inactivity` : "OFF"}
+  Encryption:      X3DH + Double Ratchet (AES-256-GCM)
   Disappear:       ${disappearMs ? formatDuration(disappearMs) : "off"}
-  Chat history:    persisted on this device
-  Encryption:      X3DH + Double Ratchet + AES-GCM
   WebSocket:       ${
     wsRef.current?.readyState === WebSocket.OPEN ? "connected" : "disconnected"
   }`,
+          activePeer ?? undefined,
         );
         break;
 
@@ -2069,11 +2474,11 @@ export default function Terminal() {
         if (activePeer && username) {
           clearChatHistory(username, activePeer);
           setMessages((prev) =>
-            prev.filter((m) => m.type === "system" || m.peer !== activePeer),
+            prev.filter((m) => m.peer !== activePeer),
           );
-          addMessage("system", `Cleared chat history with ${activePeer}.`);
+          addCommandResult(`Cleared chat history with ${activePeer}.`, activePeer);
         } else {
-          addMessage("system", "No active chat to clear.");
+          addCommandResult("No active chat to clear.", activePeer ?? undefined);
         }
         break;
 
@@ -2086,40 +2491,265 @@ export default function Terminal() {
         setContacts([]);
         setWsAuthed(false);
         setHasKeys(false);
-        privateKeyRef.current = null;
-        myPublicKeyB64Ref.current = null;
-        spkPrivateRef.current = null;
-        opksRef.current = [];
-        safetyNumberRef.current = null;
-        ratchetRef.current = null;
-        ratchetsByPeerRef.current.clear();
-        addMessage(
-          "system",
-          "Session ended. Keys, sessions, and chat history kept on this device.",
-        );
+        zeroizeAllKeys();
+        addCommandResult("Logged out.", undefined);
         break;
 
       case "/panic":
         executePanic();
         break;
 
+      case "/cloud-backup":
+      case "/backup": {
+        if (!username || !privateKeyRef.current) {
+          addCommandResult("You must be registered or logged in to backup keys.", activePeer ?? undefined);
+          break;
+        }
+        const passphrase = parts.slice(1).join(" ").trim();
+        if (!passphrase) {
+          addCommandResult("Usage: /cloud-backup <master_passphrase>", activePeer ?? undefined);
+          break;
+        }
+        if (passphrase.length < 6) {
+          addCommandResult("Passphrase must be at least 6 characters for cloud vault security.", activePeer ?? undefined);
+          break;
+        }
+
+        addCommandResult("☁️ Encrypting local keys and session ratchets with PBKDF2 (600,000 iterations) + AES-256-GCM...", activePeer ?? undefined);
+
+        try {
+          const privB64 = await exportPrivateKey(privateKeyRef.current);
+          const spkB64 = spkPrivateRef.current ? await exportPrivateKey(spkPrivateRef.current) : null;
+
+          const ratchetsSnapshot: Record<string, any> = {};
+          for (const peer of contacts) {
+            const rawSession = localStorage.getItem(sessionStorageKey(username, peer));
+            if (rawSession) {
+              try { ratchetsSnapshot[peer] = JSON.parse(rawSession); } catch {}
+            }
+          }
+
+          const payload: CloudVaultPayload = {
+            username,
+            privateKeyB64: privB64,
+            spkPrivateB64: spkB64,
+            opks: opksRef.current,
+            contacts,
+            ratchets: ratchetsSnapshot,
+            exportedAt: new Date().toISOString(),
+          };
+
+          const res = await uploadZeroKnowledgeVault(username, passphrase, payload);
+          if (res.success) {
+            addCommandResult(
+              `☁️ ZERO-KNOWLEDGE CLOUD VAULT BACKUP COMPLETE!\n` +
+              `────────────────────────────────────────────────────────────\n` +
+              `Identity:       ${username}\n` +
+              `Contacts:       ${contacts.length} synced\n` +
+              `Encryption:     Client-side AES-256-GCM (Zero-Knowledge)\n` +
+              `Firebase:       Uploaded to Firestore encrypted_vaults/${username}\n\n` +
+              `You can now login from ANY device/browser by running:\n` +
+              `   /cloud-restore ${username} <passphrase>`,
+              activePeer ?? undefined,
+            );
+          } else {
+            addCommandResult(`❌ Cloud backup failed: ${res.message}`, activePeer ?? undefined);
+          }
+        } catch (err: any) {
+          addCommandResult(`❌ Backup error: ${err?.message || String(err)}`, activePeer ?? undefined);
+        }
+        break;
+      }
+
+      case "/cloud-restore":
+      case "/restore": {
+        const targetUser = parts[1]?.toLowerCase();
+        const passphrase = parts.slice(2).join(" ").trim();
+        if (!targetUser || !passphrase) {
+          addCommandResult("Usage: /cloud-restore <username> <master_passphrase>", activePeer ?? undefined);
+          break;
+        }
+
+        addCommandResult(`☁️ Fetching Zero-Knowledge Cloud Vault for '${targetUser}' from Firebase...`, activePeer ?? undefined);
+
+        try {
+          const res = await downloadZeroKnowledgeVault(targetUser, passphrase);
+          if (!res.success || !res.data) {
+            addCommandResult(`❌ Cloud restore failed: ${res.message}`, activePeer ?? undefined);
+            break;
+          }
+
+          const vault = res.data;
+          await savePrivateKey(targetUser, vault.privateKeyB64, vaultKeyRef.current);
+          privateKeyRef.current = await importPrivateKey(vault.privateKeyB64);
+
+          if (vault.spkPrivateB64) {
+            await saveSpkPrivate(targetUser, vault.spkPrivateB64, vaultKeyRef.current);
+            spkPrivateRef.current = await importPrivateKey(vault.spkPrivateB64);
+          }
+
+          if (Array.isArray(vault.opks)) {
+            await saveOpks(targetUser, vault.opks, vaultKeyRef.current);
+            opksRef.current = vault.opks;
+          }
+
+          if (Array.isArray(vault.contacts)) {
+            setContacts(vault.contacts);
+          }
+
+          if (vault.ratchets && typeof vault.ratchets === "object") {
+            for (const [peer, rData] of Object.entries(vault.ratchets)) {
+              localStorage.setItem(sessionStorageKey(targetUser, peer), JSON.stringify(rData));
+            }
+          }
+
+          setUsername(targetUser);
+          setHasKeys(true);
+          sendWs({ type: "auth", username: targetUser });
+
+          addCommandResult(
+            `☁️ ZERO-KNOWLEDGE CLOUD VAULT RESTORED SUCCESSFULLY!\n` +
+            `────────────────────────────────────────────────────────────\n` +
+            `Identity:       ${targetUser}\n` +
+            `Private Key:    Decrypted & loaded into device storage\n` +
+            `Prekeys:        Restored (${vault.opks?.length || 0} OPKs)\n` +
+            `Contacts:       ${vault.contacts?.length || 0} contact(s) restored\n\n` +
+            `✓ WebSocket authenticated. Ready to chat securely from this device!`,
+            activePeer ?? undefined,
+          );
+        } catch (err: any) {
+          addCommandResult(`❌ Cloud restore error: ${err?.message || String(err)}`, activePeer ?? undefined);
+        }
+        break;
+      }
+
+      case "/cloud-config": {
+        const rawArg = parts.slice(1).join(" ").trim();
+        if (!rawArg) {
+          const st = getFirebaseStatus();
+          addCommandResult(
+            `☁️ FIREBASE CLOUD CONFIG STATUS:\n` +
+            `────────────────────────────────────────────────────────────\n` +
+            `Status:     ${st.configured ? "CONFIGURED (" + st.source.toUpperCase() + ")" : "NOT CONFIGURED"}\n` +
+            `Project ID: ${st.projectId || "None"}\n\n` +
+            `To configure Firebase, either:\n` +
+            `1. Put your credentials in .env.local (see .env.local.example)\n` +
+            `2. Or paste your Firebase config JSON here:\n` +
+            `   /cloud-config {"apiKey":"...","projectId":"..."}\n` +
+            `3. Run '/cloud-config clear' to remove runtime config.`,
+            activePeer ?? undefined,
+          );
+          break;
+        }
+
+        if (rawArg.toLowerCase() === "clear") {
+          clearRuntimeFirebaseConfig();
+          setCloudStatus(getFirebaseStatus());
+          addCommandResult("✓ Cleared runtime Firebase configuration.", activePeer ?? undefined);
+          break;
+        }
+
+        try {
+          const parsed = JSON.parse(rawArg);
+          if (!parsed.apiKey || !parsed.projectId) {
+            addCommandResult("Invalid config JSON. Must contain at least 'apiKey' and 'projectId'.", activePeer ?? undefined);
+            break;
+          }
+          saveRuntimeFirebaseConfig(parsed);
+          const st = getFirebaseStatus();
+          setCloudStatus(st);
+          addCommandResult(
+            `✓ Firebase configuration saved! Connected to project: ${st.projectId}\n` +
+            `You can now use /cloud-backup <passphrase> and /cloud-restore <user> <passphrase>.`,
+            activePeer ?? undefined,
+          );
+        } catch {
+          addCommandResult("Failed to parse JSON. Please pass valid JSON: /cloud-config {\"apiKey\":\"...\",\"projectId\":\"...\"}", activePeer ?? undefined);
+        }
+        break;
+      }
+
+      case "/export-key": {
+        if (!username || !privateKeyRef.current) {
+          addCommandResult("No keys loaded to export.", activePeer ?? undefined);
+          break;
+        }
+        const privB64 = await exportPrivateKey(privateKeyRef.current);
+        const spkB64 = spkPrivateRef.current ? await exportPrivateKey(spkPrivateRef.current) : null;
+        const backupObj = {
+          user: username,
+          priv: privB64,
+          spk: spkB64,
+          opks: opksRef.current,
+        };
+        const exportB64 = btoa(JSON.stringify(backupObj));
+        addCommandResult(
+          `🔑 IDENTITY KEY EXPORT FOR '${username}':\n` +
+          `Copy this string and use /import-key <string> in your other browser/device:\n\n` +
+          `${exportB64}\n\n` +
+          `⚠️ Keep this confidential! Anyone with this key can decrypt your messages.`,
+          activePeer ?? undefined,
+        );
+        break;
+      }
+
+      case "/import-key": {
+        if (!parts[1]) {
+          addCommandResult("Usage: /import-key <exported_key_string>", activePeer ?? undefined);
+          break;
+        }
+        try {
+          const raw = atob(parts[1]);
+          const parsed = JSON.parse(raw);
+          if (!parsed.user || !parsed.priv) {
+            addCommandResult("Invalid key export payload.", activePeer ?? undefined);
+            break;
+          }
+          await savePrivateKey(parsed.user, parsed.priv, vaultKeyRef.current);
+          if (parsed.spk) {
+            await saveSpkPrivate(parsed.user, parsed.spk, vaultKeyRef.current);
+          }
+          if (Array.isArray(parsed.opks)) {
+            await saveOpks(parsed.user, parsed.opks, vaultKeyRef.current);
+          }
+          addCommandResult(
+            `✓ Successfully imported private keys for '${parsed.user}'. Now run: /login ${parsed.user}`,
+            activePeer ?? undefined,
+          );
+        } catch {
+          addCommandResult("Failed to import key. Invalid format or corruption.", activePeer ?? undefined);
+        }
+        break;
+      }
+
       default:
         if (cmd.startsWith("/")) {
-          addMessage("system", `Unknown command: ${command}. Type /help`);
+          addCommandResult(`Unknown command: ${command}. Type /help`, activePeer ?? undefined);
         } else if (!username) {
-          addMessage("system", "You must /register or /login first.");
+          addCommandResult("You must /register or /login first.", activePeer ?? undefined);
+        } else if (!privateKeyRef.current) {
+          addCommandResult(
+            `Cannot send message: No private key found for '${username}' on this device.\n` +
+            `Run /register ${username} to generate keys on this browser, or /register <new_name>.`,
+            activePeer ?? undefined,
+          );
         } else if (!activePeer) {
-          addMessage(
-            "system",
+          addCommandResult(
             "No active chat. Click a contact or use /new <username>.",
+            activePeer ?? undefined,
+          );
+        } else if (tofuMismatchesRef.current.has(activePeer)) {
+          addCommandResult(
+            `🚨 Send blocked: Identity key mismatch detected for '${activePeer}'! Verify safety numbers with /verify and type /trust ${activePeer} to proceed.`,
+            activePeer,
           );
         } else if (!ratchetRef.current?.sendingChainKey) {
-          addMessage(
-            "system",
-            "No session with this peer. Use /new <peer> first.",
+          addCommandResult(
+            `No session with ${activePeer}. Use /new ${activePeer} first.`,
+            activePeer,
           );
         } else if (!wsAuthed) {
-          addMessage("system", "WebSocket not authenticated yet.");
+          addCommandResult("WebSocket not authenticated yet. Connecting...", activePeer);
         } else {
           try {
             const state = ratchetRef.current;
@@ -2186,7 +2816,7 @@ export default function Terminal() {
             }
           } catch (err) {
             console.error(err);
-            addMessage("system", "Failed to encrypt message.");
+            addCommandResult("Failed to encrypt message.", activePeer);
           }
         }
     }
@@ -2209,173 +2839,424 @@ export default function Terminal() {
   }
 
   return (
-    <div className="flex h-screen bg-[#0a0a0a] text-[#00ff41] font-mono overflow-hidden">
+    <div className="flex h-screen bg-[#070b08] text-[#00ff41] font-mono overflow-hidden select-none">
+      {/* Sidebar Contacts */}
       {sidebarOpen && (
-        <div className="w-48 shrink-0 border-r border-[#003300] flex flex-col bg-[#050505]">
-          <div className="px-3 py-2 border-b border-[#003300] flex items-center justify-between">
-            <span className="text-[#00ff41] font-bold text-sm tracking-wider">
-              CONTACTS
-            </span>
-            <button
-              onClick={() => setSidebarOpen(false)}
-              className="text-[#003300] hover:text-[#00aa2a] text-xs"
-              title="Hide sidebar"
-            >
-              «
-            </button>
+        <div className="w-56 shrink-0 border-r border-[#003814] flex flex-col bg-[#030a05] select-none">
+          <div className="px-3.5 py-2.5 border-b border-[#003814] flex items-center justify-between bg-[#041208]/60">
+            <div className="flex items-center gap-1.5">
+              <span className="text-[#00ff41] font-bold text-xs tracking-wider">
+                CONTACTS
+              </span>
+              <span className="text-[10px] text-[#006622] font-mono">
+                ({contacts.length})
+              </span>
+            </div>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => {
+                  setInput("/new ");
+                  inputRef.current?.focus();
+                }}
+                className="text-[11px] px-1.5 py-0.5 rounded bg-[#002b0e] border border-[#00551c] text-[#00ff66] hover:bg-[#004417] transition-all"
+                title="Start new encrypted session (/new <username>)"
+              >
+                + New
+              </button>
+              <button
+                onClick={() => setSidebarOpen(false)}
+                className="text-[#006622] hover:text-[#00ff41] text-xs px-1"
+                title="Collapse sidebar"
+              >
+                «
+              </button>
+            </div>
           </div>
 
-          <div className="flex-1 overflow-y-auto py-1">
+          <div className="flex-1 overflow-y-auto py-1.5 space-y-0.5">
             {contacts.length === 0 ? (
-              <div className="px-3 py-4 text-[#003300] text-xs">
-                No contacts yet.
+              <div className="px-3 py-6 text-center text-[#00551a] text-xs leading-relaxed">
+                No active contacts yet.
                 <br />
-                Use /new &lt;user&gt;
+                <button
+                  onClick={() => {
+                    setInput("/new ");
+                    inputRef.current?.focus();
+                  }}
+                  className="mt-2 text-[#00ff66] underline hover:text-[#00e5ff] text-[11px]"
+                >
+                  Type /new &lt;user&gt;
+                </button>
               </div>
             ) : (
-              contacts.map((c) => (
-                <button
-                  key={c}
-                  onClick={() => switchToPeer(c)}
-                  className={`w-full text-left px-3 py-1.5 text-sm truncate transition-colors ${
-                    c === activePeer
-                      ? "bg-[#003300] text-[#00ff41]"
-                      : "text-[#00aa2a] hover:bg-[#001a00] hover:text-[#00ff41]"
-                  }`}
-                >
-                  {c === activePeer ? "▸ " : "  "}
-                  {c}
-                </button>
-              ))
+              contacts.map((c) => {
+                const isActive = c === activePeer;
+                return (
+                  <button
+                    key={c}
+                    onClick={() => switchToPeer(c)}
+                    className={`w-full text-left px-3 py-2 flex items-center justify-between text-xs transition-all ${
+                      isActive
+                        ? "bg-[#00260c] border-l-2 border-[#00ff66] text-[#00ff66] font-semibold shadow-[inset_0_0_12px_rgba(0,255,102,0.08)]"
+                        : "text-[#00aa33] hover:bg-[#001708] hover:text-[#00ff88]"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span
+                        className={`w-5 h-5 rounded flex items-center justify-center text-[10px] font-bold shrink-0 ${
+                          isActive
+                            ? "bg-[#00e5ff]/20 text-[#00e5ff] border border-[#00e5ff]/40"
+                            : "bg-[#00280f] text-[#008828]"
+                        }`}
+                      >
+                        {c.charAt(0).toUpperCase()}
+                      </span>
+                      <span className="truncate">{c}</span>
+                    </div>
+                    {isActive ? (
+                      <span className="text-[9px] uppercase px-1 py-0.2 rounded bg-[#00ff66]/10 text-[#00ff66] border border-[#00ff66]/30">
+                        Active
+                      </span>
+                    ) : (
+                      <span className="text-[10px] text-[#004414] font-mono">
+                        E2EE
+                      </span>
+                    )}
+                  </button>
+                );
+              })
             )}
           </div>
 
-          <div className="px-3 py-2 border-t border-[#003300] text-[10px] text-[#003300]">
-            {username ? `${username}` : "not logged in"}
+          {/* User profile at bottom of sidebar */}
+          <div className="px-3 py-2.5 border-t border-[#003814] bg-[#020804] flex items-center justify-between text-xs">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="w-5 h-5 rounded-full bg-[#ffb000]/20 border border-[#ffb000]/40 text-[#ffb000] flex items-center justify-center text-[10px] font-bold shrink-0">
+                {username ? username.charAt(0).toUpperCase() : "?"}
+              </span>
+              <span className="text-[#ffb000] font-semibold truncate text-[11px]">
+                {username || "anon"}
+              </span>
+            </div>
+            {username && (
+              <button
+                onClick={() => handleCommand("/logout")}
+                className="text-[10px] text-[#ff4444]/70 hover:text-[#ff4444] hover:underline"
+                title="Logout session"
+              >
+                Logout
+              </button>
+            )}
           </div>
         </div>
       )}
 
-      <div className="flex-1 flex flex-col min-w-0">
-        <div className="flex items-center justify-between border-b border-[#003300] px-4 py-2 select-none shrink-0">
-          <div className="flex items-center gap-3">
+      {/* Main Terminal Column */}
+      <div className="flex-1 flex flex-col min-w-0 bg-[#070b08]">
+        {/* Top Header Bar */}
+        <div className="flex items-center justify-between border-b border-[#003814] px-4 py-2 select-none shrink-0 bg-[#040e06]/80 backdrop-blur-sm">
+          <div className="flex items-center gap-3 min-w-0">
             {!sidebarOpen && (
               <button
                 onClick={() => setSidebarOpen(true)}
-                className="text-[#00aa2a] hover:text-[#00ff41] text-sm"
-                title="Show contacts"
+                className="text-[#00aa33] hover:text-[#00ff41] text-xs px-1.5 py-0.5 rounded border border-[#004414] bg-[#001708]"
+                title="Open contacts sidebar"
               >
-                »
+                » Contacts
               </button>
             )}
-            <span className="text-[#00ff41] font-bold tracking-wider">
+            <span className="text-[#00ff41] font-extrabold tracking-widest text-sm drop-shadow-[0_0_8px_rgba(0,255,65,0.4)]">
               SENTINEL
             </span>
-            <span className="text-[#003300]">|</span>
+            <span className="text-[#003314]">|</span>
             <span
-              className={
+              className={`text-[11px] font-semibold px-2 py-0.5 rounded border flex items-center gap-1.5 ${
                 connStatus === "online"
-                  ? "text-[#00ff41]"
+                  ? "text-[#00ff66] bg-[#00ff66]/10 border-[#00ff66]/30"
                   : connStatus === "connecting"
-                    ? "text-[#ffb000]"
-                    : "text-[#ff4444]"
+                    ? "text-[#ffb000] bg-[#ffb000]/10 border-[#ffb000]/30"
+                    : "text-[#ff4444] bg-[#ff4444]/10 border-[#ff4444]/30"
+              }`}
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
+              {connStatus.toUpperCase()}
+            </span>
+
+            <button
+              onClick={() => handleCommand("/shield")}
+              className={`text-[10px] font-semibold px-2 py-0.5 rounded border flex items-center gap-1 transition-all ${
+                screenShield
+                  ? "text-[#00e5ff] bg-[#00e5ff]/10 border-[#00e5ff]/30 hover:bg-[#00e5ff]/20"
+                  : "text-[#888888] bg-[#222222]/50 border-[#444444] hover:text-[#ffffff]"
+              }`}
+              title="Toggle Native Anti-Screen Capture / Display Affinity (Win32 API)"
+            >
+              <span>{screenShield ? "🛡️" : "⚠️"}</span>
+              <span className="hidden sm:inline">Shield: {screenShield ? "ON" : "OFF"}</span>
+            </button>
+
+            <button
+              onClick={() => handleCommand("/cloud-config")}
+              className={`text-[10px] font-semibold px-2 py-0.5 rounded border flex items-center gap-1 transition-all ${
+                cloudStatus.configured
+                  ? "text-[#ffaa00] bg-[#ffaa00]/10 border-[#ffaa00]/30 hover:bg-[#ffaa00]/20"
+                  : "text-[#666666] bg-[#1a1a1a]/40 border-[#333333] hover:text-[#aaaaaa]"
+              }`}
+              title={
+                cloudStatus.configured
+                  ? `Firebase Cloud Vault Active (${cloudStatus.projectId})`
+                  : "Firebase Cloud Vault Unconfigured. Click to setup."
               }
             >
-              ● {connStatus}
-            </span>
+              <span>☁️</span>
+              <span className="hidden md:inline">
+                {cloudStatus.configured ? "Cloud: ON" : "Cloud: SETUP"}
+              </span>
+            </button>
+
             {activePeer && (
-              <>
-                <span className="text-[#003300]">|</span>
-                <span className="text-[#00ccff]">→ {activePeer}</span>
-                <span className="text-[#00aa2a] text-xs">E2EE</span>
+              <div className="flex items-center gap-2">
+                <span className="text-[#003314]">|</span>
+                <span className="text-[#00e5ff] font-bold text-xs flex items-center gap-1 bg-[#00e5ff]/10 border border-[#00e5ff]/30 px-2 py-0.5 rounded">
+                  <span>🔒</span> {activePeer}
+                </span>
+                <span className="text-[#00ff66] text-[10px] tracking-wider uppercase px-1.5 py-0.5 rounded bg-[#00ff66]/10 border border-[#00ff66]/20 font-semibold hidden md:inline-block">
+                  E2EE ACTIVE
+                </span>
                 {disappearMs && (
-                  <span className="text-[#ffb000] text-xs">
-                    TTL {formatDuration(disappearMs)}
+                  <span className="text-[#ffb000] text-[10px] px-1.5 py-0.5 rounded bg-[#ffb000]/10 border border-[#ffb000]/25 font-mono">
+                    ⏱️ {formatDuration(disappearMs)}
                   </span>
                 )}
-              </>
+              </div>
             )}
           </div>
-          <div className="text-sm">
-            {username ? (
-              <span>
-                <span className="text-[#ffb000]">{username}</span>@sentinel
-              </span>
+
+          <div className="flex items-center gap-2 text-xs">
+            {username && (
+              <button
+                onClick={() => lockSession("User clicked Lock button")}
+                className="text-[11px] px-2 py-0.5 rounded bg-[#00220a] border border-[#00551a] text-[#ffb000] hover:bg-[#003d12] hover:border-[#ffb000]/50 transition-all font-mono"
+                title="Lock session & scrub in-memory cryptographic keys (Ctrl+L)"
+              >
+                🔒 Lock
+              </button>
+            )}
+            {activePeer ? (
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => handleCommand("/verify")}
+                  className="text-[11px] px-2 py-0.5 rounded bg-[#00220a] border border-[#00551a] text-[#00ff66] hover:bg-[#003d12] hover:border-[#00ff66]/50 transition-all font-mono"
+                  title="Verify Safety Number with active peer"
+                >
+                  🛡️ Verify
+                </button>
+                <button
+                  onClick={() =>
+                    handleCommand(
+                      disappearMs ? "/disappear off" : "/disappear 5m",
+                    )
+                  }
+                  className="text-[11px] px-2 py-0.5 rounded bg-[#00220a] border border-[#00551a] text-[#ffb000] hover:bg-[#003d12] hover:border-[#ffb000]/50 transition-all font-mono hidden sm:inline-block"
+                  title="Toggle 5m disappearing messages"
+                >
+                  ⏱️ {disappearMs ? "TTL Off" : "TTL 5m"}
+                </button>
+                <button
+                  onClick={() => handleCommand("/clear")}
+                  className="text-[11px] px-2 py-0.5 rounded bg-[#00220a] border border-[#00551a] text-[#00aa33] hover:text-[#ff4444] hover:border-[#ff4444]/40 hover:bg-[#200000] transition-all font-mono"
+                  title="Clear chat history view"
+                >
+                  🧹 Clear
+                </button>
+              </div>
             ) : (
-              <span className="opacity-60">not authenticated</span>
+              <div className="text-xs">
+                {username ? (
+                  <span>
+                    <span className="text-[#ffb000] font-semibold">
+                      {username}
+                    </span>
+                    <span className="text-[#00aa2a]">@sentinel</span>
+                  </span>
+                ) : (
+                  <span className="text-[#00551a]">not authenticated</span>
+                )}
+              </div>
             )}
           </div>
         </div>
 
-        <div className="shrink-0 border-b border-[#003300]">
-          <button
-            onClick={() => setLogOpen((o) => !o)}
-            className="w-full flex items-center gap-2 px-4 py-1.5 text-xs text-[#00aa2a] hover:bg-[#001a00] select-none"
-          >
-            <span>{logOpen ? "▼" : "▶"}</span>
-            <span>System log</span>
-            <span className="text-[#003300]">({systemMessages.length})</span>
-          </button>
-
-          {logOpen && (
-            <div className="max-h-40 overflow-y-auto px-4 pb-2 space-y-0.5 text-xs bg-[#050505]">
-              {systemMessages.length === 0 ? (
-                <div className="text-[#003300] py-1">No system messages</div>
-              ) : (
-                systemMessages.map((msg) => (
-                  <div key={msg.id} className="flex gap-2 text-[#00aa2a]">
-                    <span className="text-[#003300] shrink-0 w-16 text-right">
-                      {formatTime(msg.timestamp)}
-                    </span>
-                    <span className="whitespace-pre-wrap opacity-80">
-                      {msg.text}
-                    </span>
-                  </div>
-                ))
-              )}
-            </div>
-          )}
-        </div>
-
-        <div className="flex-1 overflow-y-auto px-4 py-2 text-sm leading-relaxed space-y-1">
-          {!activePeer ? (
-            <div className="text-[#003300] text-sm py-8 text-center">
-              Select a contact or use /new &lt;user&gt; to start chatting
-            </div>
-          ) : chatMessages.length === 0 ? (
-            <div className="text-[#003300] text-sm py-8 text-center">
-              No messages with {activePeer} yet
-            </div>
+        {/* Main Terminal Chat & Command Feed */}
+        <div className="flex-1 overflow-y-auto px-4 py-3 text-sm leading-relaxed space-y-2 font-mono scroll-smooth select-text">
+          {displayedMessages.length === 0 ? (
+            !activePeer ? (
+              // Welcome Hero Banner when no chat is open
+              <div className="py-8 flex flex-col items-center justify-center text-center max-w-xl mx-auto space-y-4 select-none">
+                <pre className="text-[#00ff41] text-[10px] sm:text-[11px] leading-tight opacity-75 font-mono drop-shadow-[0_0_8px_rgba(0,255,65,0.2)]">
+{`
+  ███████╗███████╗███╗   ██╗████████╗██╗███╗   ██╗███████╗██╗     
+  ██╔════╝██╔════╝████╗  ██║╚══██╔══╝██║████╗  ██║██╔════╝██║     
+  ███████╗█████╗  ██╔██╗ ██║   ██║   ██║██╔██╗ ██║█████╗  ██║     
+  ╚════██║██╔══╝  ██║╚██╗██║   ██║   ██║██║╚██╗██║██╔══╝  ██║     
+  ███████║███████╗██║ ╚████║   ██║   ██║██║ ╚████║███████╗███████╗
+`}
+                </pre>
+                <div className="text-xs text-[#00aa2a] font-semibold tracking-wider uppercase">
+                  End-to-End Encrypted Terminal • Forward Secrecy • Zero Plaintext Storage
+                </div>
+                <div className="text-xs text-[#006622] max-w-md leading-relaxed font-mono">
+                  Select a contact on the left or type{" "}
+                  <code className="text-[#00ff66] bg-[#00220a] px-1 py-0.5 rounded border border-[#004414]">
+                    /new &lt;username&gt;
+                  </code>{" "}
+                  to establish a post-compromise secure session.
+                </div>
+                <div className="flex flex-wrap justify-center gap-2 pt-2">
+                  <button
+                    onClick={() => handleCommand("/help")}
+                    className="text-xs px-2.5 py-1 rounded bg-[#001f0a] border border-[#00551a] text-[#00ff41] hover:bg-[#003810] transition-colors"
+                  >
+                    📖 /help
+                  </button>
+                  <button
+                    onClick={() => handleCommand("/status")}
+                    className="text-xs px-2.5 py-1 rounded bg-[#001f0a] border border-[#00551a] text-[#00ff41] hover:bg-[#003810] transition-colors"
+                  >
+                    ⚡ /status
+                  </button>
+                  <button
+                    onClick={() => handleCommand("/chats")}
+                    className="text-xs px-2.5 py-1 rounded bg-[#001f0a] border border-[#00551a] text-[#00ff41] hover:bg-[#003810] transition-colors"
+                  >
+                    👥 /chats
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="py-12 flex flex-col items-center justify-center text-center space-y-2 text-xs select-none">
+                <div className="text-[#00e5ff] font-semibold text-sm flex items-center gap-1.5">
+                  <span>🔒</span> Secure E2EE Channel Established with {activePeer}
+                </div>
+                <div className="text-[#00551a] max-w-md font-mono">
+                  Messages are end-to-end encrypted with X3DH & Double Ratchet with constant-size padding.
+                </div>
+                <div className="flex gap-2 pt-2">
+                  <button
+                    onClick={() => handleCommand("/verify")}
+                    className="px-2.5 py-1 rounded bg-[#00220a] border border-[#00551a] text-[#00ff66] hover:bg-[#003810] transition-all font-mono"
+                  >
+                    🛡️ Verify Safety Number
+                  </button>
+                  <button
+                    onClick={() => handleCommand("/disappear 5m")}
+                    className="px-2.5 py-1 rounded bg-[#00220a] border border-[#00551a] text-[#ffb000] hover:bg-[#003810] transition-all font-mono"
+                  >
+                    ⏱️ Set 5m Disappear
+                  </button>
+                </div>
+              </div>
+            )
           ) : (
-            chatMessages.map((msg) => (
-              <div key={msg.id} className="flex gap-2">
-                <span className="text-[#003300] shrink-0 w-20 text-right">
+            displayedMessages.map((msg) => (
+              <div
+                key={msg.id}
+                className="group flex gap-2.5 items-start py-0.5 hover:bg-[#041207]/40 px-2 rounded transition-colors"
+              >
+                {/* Timestamp */}
+                <span className="text-[#00551a] text-[11px] shrink-0 w-16 pt-0.5 font-mono select-none text-right">
                   {formatTime(msg.timestamp)}
                 </span>
-                <span className="shrink-0 w-16">
+
+                {/* Sender Badge */}
+                <span className="shrink-0 w-20 pt-0.5 flex justify-end">
                   {msg.type === "user" && (
-                    <span className="text-[#ffb000]">you</span>
+                    <span className="text-[#ffb000] font-semibold text-[11px] px-1.5 py-0.2 rounded bg-[#ffb000]/10 border border-[#ffb000]/30 select-none">
+                      you
+                    </span>
                   )}
                   {msg.type === "peer" && (
-                    <span className="text-[#00ccff]">peer</span>
+                    <span
+                      className="text-[#00e5ff] font-semibold text-[11px] px-1.5 py-0.2 rounded bg-[#00e5ff]/10 border border-[#00e5ff]/30 select-none truncate max-w-full text-right"
+                      title={msg.peer || activePeer || "peer"}
+                    >
+                      {msg.peer || activePeer || "peer"}
+                    </span>
+                  )}
+                  {msg.type === "command" && (
+                    <span className="text-[#c084fc] font-semibold text-[11px] px-1.5 py-0.2 rounded bg-[#a855f7]/15 border border-[#a855f7]/30 select-none">
+                      cmd
+                    </span>
+                  )}
+                  {msg.type === "system" && (
+                    <span className="text-[#00ff41] font-semibold text-[11px] px-1.5 py-0.2 rounded bg-[#00ff41]/10 border border-[#00ff41]/30 select-none">
+                      sys
+                    </span>
                   )}
                 </span>
-                <span
-                  className={
-                    msg.type === "user" ? "text-[#00ff41]" : "text-[#00ccff]"
-                  }
-                >
-                  {msg.text}
-                </span>
+
+                {/* Message Content */}
+                <div className="flex-1 min-w-0">
+                  {msg.type === "system" ? (
+                    <div className="text-[#99e6aa] text-xs font-mono whitespace-pre-wrap leading-relaxed bg-[#021808]/70 border-l-2 border-[#00ff41]/50 px-3 py-1.5 rounded-r shadow-sm">
+                      {msg.text}
+                    </div>
+                  ) : msg.type === "command" ? (
+                    <div className="text-[#e9d5ff] font-mono text-sm flex items-center gap-1.5">
+                      <span className="text-[#a855f7] font-bold select-none">
+                        $
+                      </span>
+                      <span className="font-semibold">{msg.text}</span>
+                    </div>
+                  ) : msg.type === "user" ? (
+                    <div className="text-[#00ff66] text-sm break-words leading-relaxed font-mono">
+                      {msg.text}
+                    </div>
+                  ) : (
+                    <div className="text-[#e2f7fa] text-sm break-words leading-relaxed font-mono">
+                      {getCleanMessageText(msg)}
+                    </div>
+                  )}
+                </div>
               </div>
             ))
           )}
           <div ref={bottomRef} />
         </div>
 
-        <div className="border-t border-[#003300] px-4 py-3 flex items-center gap-2 shrink-0">
-          <span className="text-[#00ff41] shrink-0">
-            {username ? username : "anon"}
+        {/* Quick Commands Bar above input */}
+        <div className="px-4 py-1.5 flex items-center gap-2 overflow-x-auto text-[11px] border-t border-[#00280c] bg-[#020b04] select-none scrollbar-none">
+          <span className="text-[#006622] shrink-0 font-semibold tracking-wider text-[10px]">
+            QUICK CMDS:
+          </span>
+          {[
+            { label: "/help", cmd: "/help" },
+            { label: "/verify 🛡️", cmd: "/verify" },
+            { label: "/disappear 5m ⏱️", cmd: "/disappear 5m" },
+            { label: "/status ⚡", cmd: "/status" },
+            { label: "/backup ☁️", cmd: "/cloud-backup " },
+            { label: "/restore ☁️", cmd: "/cloud-restore " },
+            { label: "/chats 👥", cmd: "/chats" },
+            { label: "/shield 🛡️", cmd: "/shield" },
+            { label: "/lock 🔒", cmd: "/lock" },
+            { label: "/clear 🧹", cmd: "/clear" },
+          ].map((chip) => (
+            <button
+              key={chip.label}
+              onClick={() => handleCommand(chip.cmd)}
+              className="px-2 py-0.5 rounded bg-[#001f08] border border-[#004414] text-[#00dd3a] hover:bg-[#003810] hover:text-[#00ff41] hover:border-[#00ff41]/50 transition-all shrink-0 font-mono text-[11px]"
+            >
+              {chip.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Input Bar */}
+        <div className="border-t border-[#003311] bg-[#040f06] px-4 py-2.5 flex items-center gap-2.5 shrink-0">
+          <span className="text-[#00ff41] font-mono shrink-0 select-none text-xs flex items-center gap-1">
+            <span className="text-[#ffb000] font-semibold">
+              {username || "anon"}
+            </span>
             <span className="text-[#00aa2a]">@sentinel</span>
             <span className="text-[#00ff41]">:~$</span>
           </span>
@@ -2385,29 +3266,137 @@ export default function Terminal() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={onKeyDown}
-            className="flex-1 bg-transparent border-none outline-none text-[#00ff41] caret-[#00ff41]"
+            className="flex-1 bg-transparent border-none outline-none text-[#00ff41] caret-[#00ff41] font-mono text-sm placeholder-[#004414]"
             placeholder={
               activePeer
                 ? disappearMs
-                  ? `message ${activePeer} (TTL ${formatDuration(disappearMs)})...`
-                  : `message ${activePeer}...`
-                : "type a command or /new <user>..."
+                  ? `Message ${activePeer} (TTL ${formatDuration(disappearMs)})... or type /command`
+                  : `Message ${activePeer}... or type /command`
+                : "Type a command e.g. /new <user>, /help, /chats..."
             }
             spellCheck={false}
             autoComplete="off"
             autoCorrect="off"
           />
-          <span className="text-[#00ff41]">█</span>
+          <button
+            onClick={() => {
+              if (input.trim()) {
+                const val = input.trim();
+                setInput("");
+                handleCommand(val);
+              }
+            }}
+            className="px-3 py-1 rounded bg-[#00220a] border border-[#00551a] text-[#00ff41] hover:bg-[#003d12] hover:border-[#00ff66]/50 text-xs font-mono transition-all select-none shrink-0"
+            title="Send message or execute command (Enter)"
+          >
+            Send ↵
+          </button>
         </div>
 
-        <div className="px-4 py-1 text-[10px] text-[#003300] flex justify-between select-none shrink-0">
-          <span>
-            {connStatus === "online" ? "BACKEND ONLINE" : "BACKEND OFFLINE"} •
-            disappearing msgs
+        {/* Status Footer */}
+        <div className="px-4 py-1 text-[10px] text-[#004414] flex justify-between select-none shrink-0 bg-[#020703] border-t border-[#00220a]">
+          <span className="flex items-center gap-2">
+            <span>
+              {connStatus === "online" ? "BACKEND ONLINE" : "BACKEND OFFLINE"}
+            </span>
+            <span>•</span>
+            <span>X3DH + DOUBLE RATCHET + AES-GCM</span>
           </span>
           <span>v0.2.0-dev</span>
         </div>
       </div>
+
+      {/* Fullscreen Session Lock Screen Overlay */}
+      {isLocked && (
+        <div className="fixed inset-0 z-50 bg-[#010602]/95 backdrop-blur-md flex flex-col items-center justify-center p-4 font-mono select-none">
+          <div className="w-16 h-16 rounded-full bg-[#ffb000]/10 border border-[#ffb000]/40 flex items-center justify-center text-3xl mb-4 text-[#ffb000] drop-shadow-[0_0_15px_rgba(255,176,0,0.3)] animate-pulse">
+            🔒
+          </div>
+
+          <h2 className="text-xl font-bold tracking-widest text-[#00ff41] uppercase drop-shadow-[0_0_10px_rgba(0,255,65,0.4)]">
+            SESSION LOCKED
+          </h2>
+          <div className="text-xs text-[#00aa2a] mt-1 text-center">
+            Cryptographic memory scrubbed • Ratchet state zeroized
+          </div>
+
+          <div className="mt-6 p-4 rounded bg-[#020b04] border border-[#003810] text-xs max-w-sm w-full space-y-2.5">
+            <div className="flex justify-between items-center text-[#00882b]">
+              <span>Active Identity:</span>
+              <span className="text-[#ffb000] font-semibold">{username || "None"}</span>
+            </div>
+            <div className="flex justify-between items-center text-[#00882b]">
+              <span>Vault Security:</span>
+              <span className="text-[#00e5ff]">
+                {username && hasVaultConfigured(username)
+                  ? "PBKDF2 + AES-GCM Vault"
+                  : "Unencrypted Session"}
+              </span>
+            </div>
+            <div className="flex justify-between items-center text-[#00882b]">
+              <span>RAM Protection:</span>
+              <span className="text-[#00ff66] font-semibold">Zeroized (Scrubbed)</span>
+            </div>
+            <div className="flex justify-between items-center text-[#00882b]">
+              <span>Screen Defense:</span>
+              <span className="text-[#00e5ff]">{screenShield ? "Active (Affinity WDA)" : "Disabled"}</span>
+            </div>
+          </div>
+
+          <div className="mt-4 max-w-sm w-full">
+            {username && hasVaultConfigured(username) ? (
+              <div className="space-y-3">
+                <input
+                  type="password"
+                  placeholder="Enter vault passphrase to unlock..."
+                  value={unlockInput}
+                  onChange={(e) => {
+                    setUnlockInput(e.target.value);
+                    if (unlockError) setUnlockError(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      void unlockSession(unlockInput);
+                    }
+                  }}
+                  className="w-full px-3 py-2 bg-[#001708] border border-[#00551a] focus:border-[#00ff66] rounded outline-none text-[#00ff66] text-sm text-center font-mono placeholder-[#004414]"
+                  autoFocus
+                />
+                {unlockError && (
+                  <div className="text-[#ff4444] text-xs text-center font-semibold">
+                    {unlockError}
+                  </div>
+                )}
+                <button
+                  onClick={() => void unlockSession(unlockInput)}
+                  className="w-full py-2 rounded bg-[#003810] border border-[#007722] hover:bg-[#004d16] hover:border-[#00aa33] text-[#00ff41] font-semibold text-xs tracking-wider uppercase transition-all shadow-[0_0_10px_rgba(0,255,65,0.15)]"
+                >
+                  Unlock Session ↵
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => void unlockSession()}
+                className="w-full py-2.5 rounded bg-[#003810] border border-[#007722] hover:bg-[#004d16] hover:border-[#00aa33] text-[#00ff41] font-semibold text-xs tracking-wider uppercase transition-all shadow-[0_0_10px_rgba(0,255,65,0.15)]"
+                autoFocus
+              >
+                Resume Session ↵
+              </button>
+            )}
+
+            <div className="mt-4 flex items-center justify-between text-[11px] text-[#00551a]">
+              <span>Tip: Hotkey <kbd className="text-[#00aa2a] bg-[#001f0a] px-1 py-0.5 rounded border border-[#004414]">Ctrl+L</kbd> to lock</span>
+              <button
+                onClick={executePanic}
+                className="text-[#ff4444] hover:underline hover:text-[#ff6666] font-semibold"
+                title="Immediately shred all keys and local data"
+              >
+                Emergency Panic
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -292,19 +292,11 @@ async fn register(
 
     let mut users = state.users.lock().await;
 
-    if users.contains_key(&username) {
-        return (
-            StatusCode::CONFLICT,
-            Json(RegisterResponse {
-                success: false,
-                message: format!("Username '{}' is already taken", username),
-                user: None,
-            }),
-        );
-    }
+    let existing_id = users.get(&username).map(|u| u.id.clone());
+    let is_update = existing_id.is_some();
 
     let user = User {
-        id: Uuid::new_v4().to_string(),
+        id: existing_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
         username: username.clone(),
         created_at: chrono::Utc::now().to_rfc3339(),
         public_key: payload.public_key,
@@ -314,13 +306,22 @@ async fn register(
 
     users.insert(username, user.clone());
     save_users(&users);
-    tracing::info!("User registered: {}", user.username);
+
+    if is_update {
+        tracing::info!("User identity re-registered / key rotated: {}", user.username);
+    } else {
+        tracing::info!("User registered: {}", user.username);
+    }
 
     (
         StatusCode::CREATED,
         Json(RegisterResponse {
             success: true,
-            message: "Identity created successfully".into(),
+            message: if is_update {
+                "Identity re-registered and keys rotated successfully".into()
+            } else {
+                "Identity created successfully".into()
+            },
             user: Some(user),
         }),
     )
