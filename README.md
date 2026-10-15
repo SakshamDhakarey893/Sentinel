@@ -94,21 +94,38 @@ cd backend
 cargo run
 ```
 
-Server runs on http://localhost:8080
+Server runs on http://localhost:8080 by default.
 
-> The desktop app currently talks to the local backend the same way the browser does.
-> Later we can start the Axum server from inside Tauri or connect to a remote instance.
+### 3. Server Configuration & Remote Deployment
+
+You can point the Sentinel frontend or desktop app to any local or remote relay server:
+
+- **Via Environment Variables (`frontend/.env.local`):**
+  ```env
+  NEXT_PUBLIC_SENTINEL_API_URL=https://relay.yourdomain.com
+  NEXT_PUBLIC_SENTINEL_WS_URL=wss://relay.yourdomain.com/ws
+  ```
+- **Via In-App Terminal Command (runtime override in Desktop App):**
+  * View active server & latency: `/server`
+  * Switch to remote server: `/server https://relay.yourdomain.com`
+  * Reset to default: `/server reset`
 
 ## Current Status
 
 - [x] Project scaffolding
-- [x] Terminal-style UI mockup (client-side only)
-- [x] **Tauri desktop integration**
-- [ ] User registration + local key generation
-- [ ] Signal Protocol integration
-- [ ] WebSocket messaging
-- [ ] Disappearing messages
-- [ ] Backend persistence
+- [x] Terminal-style UI mockup & UX commands
+- [x] **Tauri desktop integration (Windows/macOS/Linux)**
+- [x] Anti-screen capture protection (`SetWindowDisplayAffinity`)
+- [x] User registration + local key generation
+- [x] Signal Protocol integration (X3DH + Double Ratchet + AES-256-GCM)
+- [x] WebSocket messaging + offline queue delivery
+- [x] Disappearing / self-destructing messages
+- [x] Constant-size message padding (Traffic analysis defense)
+- [x] Safety numbers, visual emoji fingerprints, and QR verification
+- [x] Zero-knowledge cloud vault backup & restore (AES-GCM + PBKDF2)
+- [x] Dynamic server configuration (environment variables & runtime `/server` command)
+- [ ] Backend SQL database persistence (SQLite / PostgreSQL)
+- [ ] Cryptographic challenge-response authentication on relay
 
 ## License
 

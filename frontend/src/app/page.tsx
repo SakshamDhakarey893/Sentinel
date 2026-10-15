@@ -11,9 +11,12 @@ import {
   checkCloudVaultExists,
   CloudVaultPayload,
 } from "@/lib/firebaseVault";
-
-const API_BASE = "http://localhost:8080";
-const WS_URL = "ws://localhost:8080/ws";
+import {
+  getActiveServerConfig,
+  saveRuntimeServerConfig,
+  clearRuntimeServerConfig,
+  ServerConfig,
+} from "@/lib/serverConfig";
 
 type Message = {
   id: string;
@@ -877,12 +880,20 @@ export default function Terminal() {
     source: string;
     projectId?: string;
   }>({ configured: false, source: "none" });
+  const [serverConfig, setServerConfig] = useState<ServerConfig>(() =>
+    getActiveServerConfig(),
+  );
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const usernameRef = useRef<string | null>(null);
   const activePeerRef = useRef<string | null>(null);
+  const serverConfigRef = useRef<ServerConfig>(serverConfig);
+  serverConfigRef.current = serverConfig;
+
+  const getApiBase = useCallback(() => serverConfigRef.current.apiUrl, []);
+  const getWsUrl = useCallback(() => serverConfigRef.current.wsUrl, []);
   const privateKeyRef = useRef<CryptoKey | null>(null);
   const myPublicKeyB64Ref = useRef<string | null>(null);
   const spkPrivateRef = useRef<CryptoKey | null>(null);
@@ -1225,9 +1236,10 @@ export default function Terminal() {
       second: "2-digit",
     });
 
-  const checkHealth = useCallback(async () => {
+  const checkHealth = useCallback(async (customApiUrl?: string) => {
     try {
-      const res = await fetch(`${API_BASE}/health`);
+      const base = customApiUrl || serverConfigRef.current.apiUrl;
+      const res = await fetch(`${base}/health`);
       if (res.ok) {
         const data = await res.json();
         setConnStatus("online");
@@ -1252,7 +1264,7 @@ export default function Terminal() {
 
       try {
         isReplenishingRef.current = true;
-        const res = await fetch(`${API_BASE}/api/prekeys-count/${currentName}`);
+        const res = await fetch(`${getApiBase()}/api/prekeys-count/${currentName}`);
         if (!res.ok) return;
         const data = await res.json();
         if (!data.success) return;
@@ -1277,7 +1289,7 @@ export default function Terminal() {
           await saveOpks(currentName, merged, vaultKeyRef.current);
           opksRef.current = merged;
 
-          const appendRes = await fetch(`${API_BASE}/api/prekeys/append`, {
+          const appendRes = await fetch(`${getApiBase()}/api/prekeys/append`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -1526,16 +1538,17 @@ export default function Terminal() {
     [addContact, addMessage, tryDecryptPending, loadPeerHistoryIntoView],
   );
 
-  const connectWs = useCallback(() => {
+  const connectWs = useCallback((customWsUrl?: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
     try {
-      const ws = new WebSocket(WS_URL);
+      const targetWs = customWsUrl || serverConfigRef.current.wsUrl;
+      const ws = new WebSocket(targetWs);
       wsRef.current = ws;
 
       ws.onopen = () => {
         setConnStatus("online");
-        addMessage("system", "Connected to Sentinel backend (WebSocket)");
+        addMessage("system", `Connected to Sentinel relay (${targetWs})`);
         if (usernameRef.current) {
           ws.send(
             JSON.stringify({ type: "auth", username: usernameRef.current }),
@@ -1851,14 +1864,18 @@ export default function Terminal() {
     ]);
 
     (async () => {
-      const ok = await checkHealth();
+      const cfg = getActiveServerConfig();
+      const ok = await checkHealth(cfg.apiUrl);
       if (ok) {
-        addMessage("system", "Backend online — http://localhost:8080");
-        connectWs();
+        addMessage(
+          "system",
+          `Relay online — ${cfg.apiUrl} [${cfg.source.toUpperCase()}]`,
+        );
+        connectWs(cfg.wsUrl);
       } else {
         addMessage(
           "system",
-          "Backend offline. Start it with:  cd backend && cargo run",
+          `Relay offline (${cfg.apiUrl}). Start backend with: cd backend && cargo run  (or switch relay: /server <url>)`,
         );
       }
     })();
@@ -1944,6 +1961,7 @@ export default function Terminal() {
   /reset <user>          Reset broken secure session with user
   /clear                 Clear current chat history view
   /status                Show status & security parameters
+  /server [url|reset]    View, configure, or reset relay server URL
   /cloud-backup <pass>   Backup E2EE vault to Firebase (Zero-Knowledge)
   /cloud-restore <u p>   Restore identity & sessions from Firebase on any device
   /cloud-config [json]   Configure or view Firebase credentials
@@ -2064,7 +2082,7 @@ export default function Terminal() {
           opksRef.current = opks;
           setHasKeys(true);
 
-          const res = await fetch(`${API_BASE}/api/register`, {
+          const res = await fetch(`${getApiBase()}/api/register`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -2079,7 +2097,7 @@ export default function Terminal() {
             break;
           }
 
-          const preRes = await fetch(`${API_BASE}/api/prekeys`, {
+          const preRes = await fetch(`${getApiBase()}/api/prekeys`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -2116,7 +2134,7 @@ export default function Terminal() {
         logBackground(`Logging in as "${name}"...`);
 
         try {
-          const res = await fetch(`${API_BASE}/api/login`, {
+          const res = await fetch(`${getApiBase()}/api/login`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ username: name }),
@@ -2228,7 +2246,7 @@ export default function Terminal() {
         logBackground(`Fetching prekey bundle for ${peer}...`);
 
         try {
-          const res = await fetch(`${API_BASE}/api/prekey-bundle/${peer}`);
+          const res = await fetch(`${getApiBase()}/api/prekey-bundle/${peer}`);
           const bundle = await res.json();
 
           if (
@@ -2338,7 +2356,7 @@ export default function Terminal() {
         let sn = safetyNumberRef.current;
         if (!sn) {
           try {
-            const res = await fetch(`${API_BASE}/api/public-key/${activePeer}`);
+            const res = await fetch(`${getApiBase()}/api/public-key/${activePeer}`);
             const data = await res.json();
             if (data.success && data.public_key && myPublicKeyB64Ref.current) {
               sn = await computeSafetyNumber(myPublicKeyB64Ref.current, data.public_key);
@@ -2387,7 +2405,7 @@ export default function Terminal() {
         }
         tofuMismatchesRef.current.delete(targetPeer);
         try {
-          const res = await fetch(`${API_BASE}/api/public-key/${targetPeer}`);
+          const res = await fetch(`${getApiBase()}/api/public-key/${targetPeer}`);
           const data = await res.json();
           if (data.success && data.public_key && myPublicKeyB64Ref.current) {
             const sn = await computeSafetyNumber(myPublicKeyB64Ref.current, data.public_key);
@@ -2452,13 +2470,106 @@ export default function Terminal() {
         break;
       }
 
+      case "/server": {
+        if (!parts[1]) {
+          const cfg = getActiveServerConfig();
+          const t0 = performance.now();
+          let pingStr = "testing...";
+          try {
+            const res = await fetch(`${cfg.apiUrl}/health`, { signal: AbortSignal.timeout(3000) });
+            const lat = Math.round(performance.now() - t0);
+            if (res.ok) {
+              const data = await res.json();
+              pingStr = `ONLINE (${lat}ms latency | ${data.users_online ?? 0} online / ${data.users_registered ?? 0} registered)`;
+            } else {
+              pingStr = `HTTP ${res.status}`;
+            }
+          } catch (e: any) {
+            pingStr = `OFFLINE / UNREACHABLE (${e?.message || "connection error"})`;
+          }
+
+          addCommandResult(
+            `🌐 SENTINEL RELAY CONFIGURATION:\n` +
+            `────────────────────────────────────────────────────────────\n` +
+            `API ENDPOINT:   ${cfg.apiUrl}\n` +
+            `WEBSOCKET:      ${cfg.wsUrl}\n` +
+            `CONFIG SOURCE:  ${cfg.source.toUpperCase()} (${cfg.source === "runtime" ? "Custom override in localStorage" : cfg.source === "env" ? "Environment variable" : "Default fallback"})\n` +
+            `STATUS:         ${pingStr}\n\n` +
+            `Usage:\n` +
+            `  /server <url>    Point to a remote relay server (e.g. /server https://relay.example.com)\n` +
+            `  /server reset    Reset to environment default`,
+            activePeer ?? undefined,
+          );
+          break;
+        }
+
+        if (parts[1].toLowerCase() === "reset") {
+          clearRuntimeServerConfig();
+          const def = getActiveServerConfig();
+          setServerConfig(def);
+          serverConfigRef.current = def;
+
+          if (wsRef.current) {
+            wsRef.current.close();
+            wsRef.current = null;
+          }
+          setWsAuthed(false);
+
+          addCommandResult(
+            `Relay configuration reset to: ${def.apiUrl} [${def.source.toUpperCase()}]. Reconnecting...`,
+            activePeer ?? undefined,
+          );
+
+          const ok = await checkHealth(def.apiUrl);
+          if (ok) {
+            connectWs(def.wsUrl);
+          }
+          break;
+        }
+
+        const inputUrl = parts[1];
+        const res = saveRuntimeServerConfig(inputUrl);
+        if (!res.success) {
+          addCommandResult(`Error setting relay server: ${res.error}`, activePeer ?? undefined);
+          break;
+        }
+
+        const newCfg: ServerConfig = {
+          apiUrl: res.apiUrl,
+          wsUrl: res.wsUrl,
+          source: "runtime",
+        };
+        setServerConfig(newCfg);
+        serverConfigRef.current = newCfg;
+
+        if (wsRef.current) {
+          wsRef.current.close();
+          wsRef.current = null;
+        }
+        setWsAuthed(false);
+
+        addCommandResult(
+          `✓ Relay server updated to:\n  API: ${newCfg.apiUrl}\n  WS:  ${newCfg.wsUrl}\nSaved in localStorage. Testing connection...`,
+          activePeer ?? undefined,
+        );
+
+        const ok = await checkHealth(newCfg.apiUrl);
+        if (ok) {
+          addCommandResult(`✓ Connected to new relay server!`, activePeer ?? undefined);
+          connectWs(newCfg.wsUrl);
+        } else {
+          addCommandResult(`⚠️ Server saved, but health check failed at ${newCfg.apiUrl}. Check that the relay is running and reachable.`, activePeer ?? undefined);
+        }
+        break;
+      }
+
       case "/status":
         addCommandResult(
           `Status:
   User:            ${username || "not registered"}
   Active chat:     ${activePeer || "none"}
   Contacts:        ${contacts.length}
-  Backend:         ${connStatus.toUpperCase()}
+  Backend:         ${connStatus.toUpperCase()} (${serverConfigRef.current.apiUrl} [${serverConfigRef.current.source.toUpperCase()}])
   Screen Shield:   ${screenShield ? "ACTIVE (Anti-Screen Capture)" : "DISABLED"}
   Auto-Lock:       ${autoLockMinutes > 0 ? `${autoLockMinutes} min inactivity` : "OFF"}
   Encryption:      X3DH + Double Ratchet (AES-256-GCM)
