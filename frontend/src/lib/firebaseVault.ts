@@ -3,11 +3,13 @@ import { getFirestore, doc, getDoc, setDoc, Firestore } from "firebase/firestore
 
 export interface CloudVaultPayload {
   username: string;
+  publicKeyB64?: string;
   privateKeyB64: string;
   spkPrivateB64: string | null;
   opks: { pub: string; priv: string }[];
   contacts: string[];
   ratchets: Record<string, any>;
+  chatHistories?: Record<string, any>; // peer -> message array (serializable)
   exportedAt: string;
 }
 

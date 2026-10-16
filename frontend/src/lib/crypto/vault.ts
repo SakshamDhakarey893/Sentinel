@@ -133,6 +133,20 @@ export async function unlockVault(
   }
 }
 
+export function savePublicKey(username: string, b64: string) {
+  try {
+    localStorage.setItem(`sentinel_pub_${username}`, b64);
+  } catch {}
+}
+
+export function loadPublicKey(username: string): string | null {
+  try {
+    return localStorage.getItem(`sentinel_pub_${username}`);
+  } catch {
+    return null;
+  }
+}
+
 export async function savePrivateKey(
   username: string,
   b64: string,
@@ -373,3 +387,17 @@ export function loadDisappearMs(username: string, peer: string): number | null {
   const n = parseInt(raw, 10);
   return Number.isFinite(n) && n > 0 ? n : null;
 }
+
+export function listSavedChatPeers(username: string): string[] {
+  if (typeof window === "undefined" || !window.localStorage) return [];
+  const peers: string[] = [];
+  const prefix = `sentinel_chat_${username}_`;
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key && key.startsWith(prefix)) {
+      peers.push(key.slice(prefix.length));
+    }
+  }
+  return peers;
+}
+

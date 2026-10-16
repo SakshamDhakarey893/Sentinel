@@ -30,6 +30,7 @@ import {
   exportPrivateKey,
   importPrivateKey,
   deriveSharedSecret,
+  extractPublicKeyFromPkcs8,
 } from "@/lib/crypto/keys";
 import {
   importHmacKey,
@@ -49,6 +50,8 @@ import {
   listSavedPeers,
   clearPeerSession,
   sessionStorageKey,
+  serializeRatchet,
+  deserializeRatchet,
 } from "@/lib/crypto/ratchet";
 import {
   computeSafetyNumber,
@@ -63,6 +66,8 @@ import {
   setupNewVault,
   unlockVault,
   hasVaultConfigured,
+  savePublicKey,
+  loadPublicKey,
   savePrivateKey,
   loadPrivateKey,
   saveSpkPrivate,
@@ -72,6 +77,8 @@ import {
   saveChatHistory,
   loadChatHistory,
   clearChatHistory,
+  listSavedChatPeers,
+  ChatMessage,
   parseDuration,
   formatDuration,
   saveDisappearMs,
@@ -97,7 +104,12 @@ type Message = {
   isCmdResult?: boolean;
 };
 
-type ConnStatus = "connecting" | "online" | "offline";
+type ConnStatus =
+  | "connecting"
+  | "connected"
+  | "online"
+  | "offline"
+  | "auth_failed";
 
 // ─── Component ──────────────────────────────────────────────────────────────
 
@@ -111,6 +123,8 @@ export default function Terminal() {
   const [usersCount, setUsersCount] = useState(0);
   const [mounted, setMounted] = useState(false);
   const [wsAuthed, setWsAuthed] = useState(false);
+  const wsAuthedRef = useRef<boolean>(false);
+  const authRetryCountRef = useRef<number>(0);
   const [hasKeys, setHasKeys] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [logOpen, setLogOpen] = useState(true);
@@ -157,6 +171,9 @@ export default function Terminal() {
   const tofuMismatchesRef = useRef<Set<string>>(new Set());
   const lastUserActivityRef = useRef<number>(Date.now());
   const sessionTokenRef = useRef<string | null>(null);
+  const sessionPassphraseRef = useRef<string | null>(null);
+  const syncTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const isSyncingRef = useRef<boolean>(false);
 
   const pendingCiphertextsRef = useRef<
     Map<string, { id: string; header: any; body: string; from: string }[]>
@@ -189,6 +206,12 @@ export default function Terminal() {
     opksRef.current = [];
     vaultKeyRef.current = null;
     safetyNumberRef.current = null;
+
+    if (syncTimeoutRef.current) {
+      clearTimeout(syncTimeoutRef.current);
+      syncTimeoutRef.current = null;
+    }
+    sessionPassphraseRef.current = null;
   }, []);
 
   const executePanic = useCallback(() => {
@@ -432,6 +455,10 @@ export default function Terminal() {
       setUnlockError(null);
       setUnlockInput("");
       lastUserActivityRef.current = Date.now();
+      if (passphrase) {
+        sessionPassphraseRef.current = passphrase;
+        requestSync("unlock", 2000);
+      }
       addCommandResult(
         "✓ Session unlocked. In-memory keys restored.",
         activePeerRef.current ?? undefined,
@@ -439,6 +466,134 @@ export default function Terminal() {
       return true;
     },
     [addCommandResult],
+  );
+
+  const triggerCloudSync = useCallback(
+    async (reason: string = "periodic") => {
+      const currentName = usernameRef.current;
+      const passphrase = sessionPassphraseRef.current;
+      const privKey = privateKeyRef.current;
+
+      if (!currentName || !passphrase || !privKey || isSyncingRef.current) {
+        return;
+      }
+
+      const fbStatus = getFirebaseStatus();
+      if (!fbStatus.configured) {
+        logBackground(`Cloud auto-sync skipped (${reason}): Firebase not configured.`);
+        return;
+      }
+
+      try {
+        isSyncingRef.current = true;
+        logBackground(`☁️ Starting Zero-Knowledge Cloud auto-sync (${reason})...`);
+
+        const privB64 = await exportPrivateKey(privKey);
+        const spkB64 = spkPrivateRef.current
+          ? await exportPrivateKey(spkPrivateRef.current)
+          : null;
+
+        const allPeers = Array.from(
+          new Set([
+            ...contacts,
+            ...listSavedPeers(currentName),
+            ...listSavedChatPeers(currentName),
+          ]),
+        );
+
+        const ratchetsSnapshot: Record<string, any> = {};
+        for (const peer of allPeers) {
+          const memRatchet = ratchetsByPeerRef.current.get(peer);
+          if (memRatchet) {
+            try {
+              ratchetsSnapshot[peer] = await serializeRatchet(memRatchet);
+            } catch {}
+          } else {
+            const rawSession = localStorage.getItem(
+              sessionStorageKey(currentName, peer),
+            );
+            if (rawSession) {
+              try {
+                const parsed = JSON.parse(rawSession);
+                if (parsed.v === 2 && parsed.enc && vaultKeyRef.current) {
+                  const dec = await decryptWithVaultKey(
+                    vaultKeyRef.current,
+                    parsed.enc,
+                  );
+                  ratchetsSnapshot[peer] = JSON.parse(dec);
+                } else {
+                  ratchetsSnapshot[peer] = parsed;
+                }
+              } catch {}
+            }
+          }
+        }
+
+        const historiesSnapshot: Record<string, any> = {};
+        for (const peer of allPeers) {
+          const msgs = await loadChatHistory(
+            currentName,
+            peer,
+            vaultKeyRef.current,
+          );
+          if (msgs && msgs.length > 0) {
+            historiesSnapshot[peer] = msgs.map((m) => ({
+              id: m.id,
+              type: m.type,
+              text: m.text,
+              timestamp:
+                m.timestamp instanceof Date
+                  ? m.timestamp.toISOString()
+                  : String(m.timestamp),
+              peer: m.peer || peer,
+            }));
+          }
+        }
+
+        const payload: CloudVaultPayload = {
+          username: currentName,
+          publicKeyB64:
+            myPublicKeyB64Ref.current || loadPublicKey(currentName) || undefined,
+          privateKeyB64: privB64,
+          spkPrivateB64: spkB64,
+          opks: opksRef.current,
+          contacts: allPeers,
+          ratchets: ratchetsSnapshot,
+          chatHistories: historiesSnapshot,
+          exportedAt: new Date().toISOString(),
+        };
+
+        const res = await uploadZeroKnowledgeVault(
+          currentName,
+          passphrase,
+          payload,
+        );
+        if (res.success) {
+          logBackground(`✓ Cloud auto-sync complete (${reason}).`);
+        } else {
+          logBackground(`⚠️ Cloud auto-sync notice (${reason}): ${res.message}`);
+        }
+      } catch (err: any) {
+        logBackground(
+          `⚠️ Cloud auto-sync error (${reason}): ${err?.message || String(err)}`,
+        );
+      } finally {
+        isSyncingRef.current = false;
+      }
+    },
+    [contacts, logBackground],
+  );
+
+  const requestSync = useCallback(
+    (reason: string = "update", delayMs: number = 2500) => {
+      if (syncTimeoutRef.current) {
+        clearTimeout(syncTimeoutRef.current);
+      }
+      syncTimeoutRef.current = setTimeout(() => {
+        void triggerCloudSync(reason);
+      }, delayMs);
+    },
+    [triggerCloudSync],
   );
 
   const addMessage = useCallback(
@@ -471,19 +626,26 @@ export default function Terminal() {
             next,
             vaultKeyRef.current,
           );
+          if (type === "user") {
+            requestSync("outbound message", 3000);
+          }
         }
         return next;
       });
     },
-    [],
+    [requestSync],
   );
 
-  const addContact = useCallback((peer: string) => {
-    setContacts((prev) => {
-      if (prev.includes(peer)) return prev;
-      return [...prev, peer].sort();
-    });
-  }, []);
+  const addContact = useCallback(
+    (peer: string) => {
+      setContacts((prev) => {
+        if (prev.includes(peer)) return prev;
+        return [...prev, peer].sort();
+      });
+      requestSync("new contact", 1000);
+    },
+    [requestSync],
+  );
 
   const formatTime = (d: Date) =>
     d.toLocaleTimeString("en-US", {
@@ -499,20 +661,28 @@ export default function Terminal() {
       const res = await fetch(`${base}/health`);
       if (res.ok) {
         const data = await res.json();
-        setConnStatus("online");
         setUsersCount(data.users_online ?? data.users_registered ?? 0);
         return true;
       }
     } catch {}
     setConnStatus("offline");
+    setWsAuthed(false);
+    wsAuthedRef.current = false;
     return false;
   }, []);
 
-  const sendWs = useCallback((obj: object) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(obj));
-    }
-  }, []);
+  const sendWs = useCallback(
+    (obj: { type?: string; [key: string]: any }) => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        if (obj.type === "message" && !wsAuthedRef.current) {
+          logBackground("Outbound message blocked: WebSocket is not authenticated on relay.");
+          return;
+        }
+        wsRef.current.send(JSON.stringify(obj));
+      }
+    },
+    [logBackground],
+  );
 
   const replenishPrekeys = useCallback(
     async (minThreshold = 5, batchSize = 15) => {
@@ -800,58 +970,148 @@ export default function Terminal() {
     [addContact, addMessage, tryDecryptPending, loadPeerHistoryIntoView],
   );
 
-  const connectWs = useCallback((customWsUrl?: string) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+  const sendWsAuth = useCallback(
+    async (forcedToken?: string) => {
+      const u = usernameRef.current;
+      if (!u) return false;
+      if (wsRef.current?.readyState !== WebSocket.OPEN) return false;
 
-    try {
-      const targetWs = customWsUrl || serverConfigRef.current.wsUrl;
-      const ws = new WebSocket(targetWs);
-      wsRef.current = ws;
-
-      ws.onopen = async () => {
-        setConnStatus("online");
-        addMessage("system", `Connected to Sentinel relay (${targetWs})`);
-        if (usernameRef.current) {
-          const u = usernameRef.current;
-          let token = sessionTokenRef.current || getStoredSessionToken(u);
-          if (!token && privateKeyRef.current) {
-            const authRes = await authenticateWithRelay(
-              getApiBase(),
-              u,
-              privateKeyRef.current,
-            );
-            if (authRes.success && authRes.token) {
-              token = authRes.token;
-              sessionTokenRef.current = token;
-            }
-          }
-          ws.send(
-            JSON.stringify({
-              type: "auth",
-              username: u,
-              token: token || undefined,
-            }),
+      let token = forcedToken || sessionTokenRef.current || getStoredSessionToken(u);
+      if (!token && privateKeyRef.current) {
+        logBackground(`Solving cryptographic challenge from relay for '${u}'...`);
+        const authRes = await authenticateWithRelay(
+          getApiBase(),
+          u,
+          privateKeyRef.current,
+        );
+        if (authRes.success && authRes.token) {
+          token = authRes.token;
+          sessionTokenRef.current = token;
+          saveStoredSessionToken(u, token);
+        } else {
+          addCommandResult(
+            `⚠️ Relay challenge authentication failed: ${authRes.error}`,
+            activePeerRef.current ?? undefined,
           );
+          setConnStatus("auth_failed");
+          wsAuthedRef.current = false;
+          setWsAuthed(false);
+          return false;
         }
-      };
+      }
 
-      ws.onmessage = async (evt) => {
-        try {
-          const msg = JSON.parse(evt.data);
+      setConnStatus("connected");
+      wsRef.current.send(
+        JSON.stringify({
+          type: "auth",
+          username: u,
+          token: token || undefined,
+        }),
+      );
+      return true;
+    },
+    [getApiBase, addCommandResult, logBackground],
+  );
 
-          switch (msg.type) {
-            case "auth_ok":
-              setWsAuthed(true);
-              addMessage(
-                "system",
-                `WebSocket authenticated as ${msg.username}`,
-              );
-              break;
+  const connectWs = useCallback(
+    (customWsUrl?: string, forceReauth?: boolean) => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        if (forceReauth || !wsAuthedRef.current) {
+          void sendWsAuth();
+        }
+        return;
+      }
+      if (wsRef.current?.readyState === WebSocket.CONNECTING) {
+        return;
+      }
 
-            case "auth_error":
-              setWsAuthed(false);
-              addMessage("system", `Auth error: ${msg.message}`);
-              break;
+      try {
+        setConnStatus("connecting");
+        const targetWs = customWsUrl || serverConfigRef.current.wsUrl;
+        const ws = new WebSocket(targetWs);
+        wsRef.current = ws;
+
+        ws.onopen = async () => {
+          setConnStatus("connected");
+          addMessage("system", `Connected to Sentinel relay (${targetWs})`);
+          if (usernameRef.current) {
+            await sendWsAuth();
+          }
+        };
+
+        ws.onmessage = async (evt) => {
+          try {
+            const msg = JSON.parse(evt.data);
+
+            switch (msg.type) {
+              case "auth_ok":
+                wsAuthedRef.current = true;
+                setWsAuthed(true);
+                setConnStatus("online");
+                authRetryCountRef.current = 0;
+                if (typeof msg.users_authenticated === "number") {
+                  setUsersCount(msg.users_authenticated);
+                }
+                addCommandResult(
+                  `✓ WebSocket authenticated as ${msg.username} [RELAY ONLINE]`,
+                  activePeerRef.current ?? undefined,
+                );
+                break;
+
+              case "auth_error": {
+                wsAuthedRef.current = false;
+                setWsAuthed(false);
+                setConnStatus("auth_failed");
+                addCommandResult(
+                  `❌ Relay Auth error: ${msg.message}`,
+                  activePeerRef.current ?? undefined,
+                );
+
+                if (
+                  authRetryCountRef.current === 0 &&
+                  usernameRef.current &&
+                  privateKeyRef.current
+                ) {
+                  authRetryCountRef.current = 1;
+                  const u = usernameRef.current;
+                  addCommandResult(
+                    `[Relay] Session token rejected or expired. Solving cryptographic challenge to renew token...`,
+                    activePeerRef.current ?? undefined,
+                  );
+                  clearStoredSessionToken(u);
+                  sessionTokenRef.current = null;
+                  void (async () => {
+                    const authRes = await authenticateWithRelay(
+                      getApiBase(),
+                      u,
+                      privateKeyRef.current!,
+                    );
+                    if (authRes.success && authRes.token) {
+                      sessionTokenRef.current = authRes.token;
+                      saveStoredSessionToken(u, authRes.token);
+                      addCommandResult(
+                        `✓ Renewed session token via relay challenge. Re-authenticating WebSocket...`,
+                        activePeerRef.current ?? undefined,
+                      );
+                      if (wsRef.current?.readyState === WebSocket.OPEN) {
+                        wsRef.current.send(
+                          JSON.stringify({
+                            type: "auth",
+                            username: u,
+                            token: authRes.token,
+                          }),
+                        );
+                      }
+                    } else {
+                      addCommandResult(
+                        `❌ Challenge-response token renewal failed: ${authRes.error}`,
+                        activePeerRef.current ?? undefined,
+                      );
+                    }
+                  })();
+                }
+                break;
+              }
 
             case "message": {
               try {
@@ -1100,16 +1360,31 @@ export default function Terminal() {
 
       ws.onclose = () => {
         setConnStatus("offline");
+        wsAuthedRef.current = false;
         setWsAuthed(false);
         wsRef.current = null;
-        setTimeout(connectWs, 5000);
+        setTimeout(() => connectWs(), 5000);
       };
 
-      ws.onerror = () => setConnStatus("offline");
+      ws.onerror = () => {
+        setConnStatus("offline");
+        wsAuthedRef.current = false;
+        setWsAuthed(false);
+      };
     } catch {
       setConnStatus("offline");
+      wsAuthedRef.current = false;
+      setWsAuthed(false);
     }
-  }, [addMessage, addContact, tryDecryptPending, scheduleDisappear]);
+  }, [
+    sendWsAuth,
+    addMessage,
+    addContact,
+    addCommandResult,
+    getApiBase,
+    tryDecryptPending,
+    scheduleDisappear,
+  ]);
 
   useEffect(() => {
     setMounted(true);
@@ -1215,49 +1490,70 @@ export default function Terminal() {
     return () => clearInterval(interval);
   }, [username, hasKeys, replenishPrekeys]);
 
+  useEffect(() => {
+    if (!username || !hasKeys) return;
+    const interval = setInterval(() => {
+      void triggerCloudSync("periodic (3m)");
+    }, 3 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, [username, hasKeys, triggerCloudSync]);
+
   // ─── Commands ─────────────────────────────────────────────────────────────
 
   const handleCommand = async (cmd: string) => {
     const trimmed = cmd.trim();
     if (!trimmed) return;
 
+    const parts = trimmed.split(/\s+/);
+    const command = parts[0].toLowerCase();
+
     if (trimmed.startsWith("/")) {
-      addMessage("command", trimmed, activePeer ?? undefined);
+      // Mask passphrase in command output and history to protect credentials
+      const isSensitive =
+        command === "/register" ||
+        command === "/login" ||
+        command === "/cloud-backup" ||
+        command === "/backup" ||
+        command === "/cloud-restore" ||
+        command === "/restore" ||
+        command === "/unlock";
+      const sanitizedCmd = isSensitive
+        ? `${parts[0]}${parts[1] ? " " + parts[1] : ""} ********`
+        : trimmed;
+
+      addMessage("command", sanitizedCmd, activePeer ?? undefined);
       if (activePeer) {
         setLogOpen(true);
       }
     }
 
-    const parts = trimmed.split(/\s+/);
-    const command = parts[0].toLowerCase();
-
     switch (command) {
       case "/help":
         addCommandResult(
           `Available commands:
-  /help                  Show this help
-  /log                   Toggle console & system log drawer
-  /register <username>   Create identity + prekeys
-  /login <username>      Login and load keys + history
-  /new <user>            Start or restore session with user
-  /chats                 List contacts / sessions
-  /verify                Show Safety Number & TOFU verification status
-  /trust [user]          Explicitly trust remote Identity Key after rotation
-  /shield [on|off]       Toggle Anti-Screen Capture / OBS defense (Win32)
-  /lock [mins|off]       Lock terminal immediately (or set auto-lock timer)
-  /unlock <passphrase>   Unlock terminal & decrypt in-memory keys
-  /disappear <time|off>  Auto-delete msgs (30s, 5m, 1h, off)
-  /reset <user>          Reset broken secure session with user
-  /clear                 Clear current chat history view
-  /status                Show status & security parameters
-  /server [url|reset]    View, configure, or reset relay server URL
-  /cloud-backup <pass>   Backup E2EE vault to Firebase (Zero-Knowledge)
-  /cloud-restore <u p>   Restore identity & sessions from Firebase on any device
-  /cloud-config [json]   Configure or view Firebase credentials
-  /export-key            Export armored private keys for other devices
-  /import-key <key>      Import private keys on this browser
-  /logout                End session
-  /panic                 Purge memory & shred local storage (Ctrl+Shift+X)
+  /help                         Show this help
+  /log                          Toggle console & system log drawer
+  /register <user> <passphrase> Create identity + vault & auto-backup to cloud
+  /login <user> <passphrase>    Login, unlock vault & auto-restore from cloud
+  /new <user>                   Start or restore session with user
+  /chats                        List contacts / sessions
+  /verify                       Show Safety Number & TOFU verification status
+  /trust [user]                 Explicitly trust remote Identity Key after rotation
+  /shield [on|off]              Toggle Anti-Screen Capture / OBS defense (Win32)
+  /lock [mins|off]              Lock terminal immediately (or set auto-lock timer)
+  /unlock <passphrase>          Unlock terminal & decrypt in-memory keys
+  /disappear <time|off>         Auto-delete msgs (30s, 5m, 1h, off)
+  /reset <user>                 Reset broken secure session with user
+  /clear                        Clear current chat history view
+  /status                       Show status & security parameters
+  /server [url|reset]           View, configure, or reset relay server URL
+  /cloud-backup [passphrase]    Force Zero-Knowledge backup to Firebase
+  /cloud-restore <u p>          Manual restore from Firebase on any device
+  /cloud-config [json]          Configure or view Firebase credentials
+  /export-key                   Export armored private keys for other devices
+  /import-key <key>             Import private keys on this browser
+  /logout                       End session & lock vault
+  /panic                        Purge memory & shred local storage (Ctrl+Shift+X)
 
   Hotkeys: Ctrl+L (Lock) | Ctrl+Shift+X (Panic Shred)`,
           activePeer ?? undefined,
@@ -1346,14 +1642,26 @@ export default function Terminal() {
       }
 
       case "/register": {
-        if (!parts[1]) {
-          addCommandResult("Usage: /register <username>", activePeer ?? undefined);
+        const name = parts[1]?.toLowerCase();
+        const passphrase = parts.slice(2).join(" ").trim();
+        if (!name || !passphrase) {
+          addCommandResult(
+            "Usage: /register <username> <passphrase>",
+            activePeer ?? undefined,
+          );
           break;
         }
-        const name = parts[1].toLowerCase();
-        logBackground(`Registering "${name}"...`);
+        if (passphrase.length < 8) {
+          addCommandResult(
+            "Passphrase must be at least 8 characters for vault security.",
+            activePeer ?? undefined,
+          );
+          break;
+        }
+        logBackground(`Registering "${name}" with encrypted master vault...`);
 
         try {
+          // 1. Generate identity, signed prekey, and one-time prekeys
           const identity = await generateKeyPair();
           const publicKeyB64 = await exportPublicKey(identity.publicKey);
           const privateKeyB64 = await exportPrivateKey(identity.privateKey);
@@ -1371,22 +1679,57 @@ export default function Terminal() {
             });
           }
 
-          await savePrivateKey(name, privateKeyB64, vaultKeyRef.current);
-          await saveSpkPrivate(name, spkPriv, vaultKeyRef.current);
-          await saveOpks(name, opks, vaultKeyRef.current);
+          // 2. Setup local master vault using the user passphrase
+          const vKey = await setupNewVault(name, passphrase);
+          vaultKeyRef.current = vKey;
+          setVaultStatus("unlocked");
+
+          // 3. Store encrypted keys locally with the master vault key
+          await savePrivateKey(name, privateKeyB64, vKey);
+          await saveSpkPrivate(name, spkPriv, vKey);
+          await saveOpks(name, opks, vKey);
 
           privateKeyRef.current = identity.privateKey;
           myPublicKeyB64Ref.current = publicKeyB64;
+          savePublicKey(name, publicKeyB64);
           spkPrivateRef.current = spk.privateKey;
           opksRef.current = opks;
           setHasKeys(true);
+          sessionPassphraseRef.current = passphrase;
 
-          const existingToken = sessionTokenRef.current || getStoredSessionToken(name);
+          // 4. Zero-knowledge upload to Firebase Cloud Vault
+          const cloudPayload: CloudVaultPayload = {
+            username: name,
+            publicKeyB64,
+            privateKeyB64,
+            spkPrivateB64: spkPriv,
+            opks,
+            contacts: [],
+            ratchets: {},
+            chatHistories: {},
+            exportedAt: new Date().toISOString(),
+          };
+          const cloudRes = await uploadZeroKnowledgeVault(
+            name,
+            passphrase,
+            cloudPayload,
+          );
+          if (cloudRes.success) {
+            logBackground("✓ Zero-Knowledge Cloud Vault initialized on Firebase.");
+          } else {
+            logBackground(`Cloud backup notice: ${cloudRes.message}`);
+          }
+
+          // 5. Register with relay server
+          const existingToken =
+            sessionTokenRef.current || getStoredSessionToken(name);
           const res = await fetch(`${getApiBase()}/api/register`, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              ...(existingToken ? { Authorization: `Bearer ${existingToken}` } : {}),
+              ...(existingToken
+                ? { Authorization: `Bearer ${existingToken}` }
+                : {}),
             },
             body: JSON.stringify({
               username: name,
@@ -1397,7 +1740,10 @@ export default function Terminal() {
           const data = await res.json();
 
           if (!data.success) {
-            addCommandResult(`Registration error: ${data.message}`, activePeer ?? undefined);
+            addCommandResult(
+              `Registration error: ${data.message}`,
+              activePeer ?? undefined,
+            );
             break;
           }
 
@@ -1406,11 +1752,14 @@ export default function Terminal() {
             saveStoredSessionToken(name, data.token);
           }
 
+          // 6. Upload prekeys to relay
           const preRes = await fetch(`${getApiBase()}/api/prekeys`, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              ...(sessionTokenRef.current ? { Authorization: `Bearer ${sessionTokenRef.current}` } : {}),
+              ...(sessionTokenRef.current
+                ? { Authorization: `Bearer ${sessionTokenRef.current}` }
+                : {}),
             },
             body: JSON.stringify({
               username: name,
@@ -1422,35 +1771,204 @@ export default function Terminal() {
           await preRes.json();
 
           setUsername(data.user.username);
-          const saved = listSavedPeers(data.user.username);
+          const saved = Array.from(
+            new Set([
+              ...listSavedPeers(data.user.username),
+              ...listSavedChatPeers(data.user.username),
+            ]),
+          );
           if (saved.length > 0) {
             setContacts(saved);
           }
 
-          sendWs({
-            type: "auth",
-            username: data.user.username,
-            token: sessionTokenRef.current || undefined,
-          });
+          authRetryCountRef.current = 0;
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            void sendWsAuth(sessionTokenRef.current || undefined);
+          } else {
+            connectWs(undefined, true);
+          }
           setUsersCount((c) => c + 1);
-          addCommandResult(`Registered identity "${data.user.username}". E2EE prekeys ready.`, activePeer ?? undefined);
+
+          addCommandResult(
+            `✓ Registered identity "${data.user.username}". Master vault initialized with Zero-Knowledge encryption & auto-sync active.`,
+            activePeer ?? undefined,
+          );
         } catch (err) {
           console.error(err);
-          addCommandResult("Failed to register. Is the backend running?", activePeer ?? undefined);
+          addCommandResult(
+            "Failed to register. Is the backend running?",
+            activePeer ?? undefined,
+          );
           setConnStatus("offline");
         }
         break;
       }
 
       case "/login": {
-        if (!parts[1]) {
-          addCommandResult("Usage: /login <username>", activePeer ?? undefined);
+        const name = parts[1]?.toLowerCase();
+        const passphrase = parts.slice(2).join(" ").trim();
+        if (!name || !passphrase) {
+          addCommandResult(
+            "Usage: /login <username> <passphrase>",
+            activePeer ?? undefined,
+          );
           break;
         }
-        const name = parts[1].toLowerCase();
-        logBackground(`Logging in as "${name}"...`);
+        if (passphrase.length < 8) {
+          addCommandResult(
+            "Passphrase must be at least 8 characters.",
+            activePeer ?? undefined,
+          );
+          break;
+        }
+        logBackground(`Logging in as "${name}" with Zero-Knowledge verification...`);
 
         try {
+          let keysLoaded = false;
+          let restoredFromCloud = false;
+
+          // 1. Check and try downloading Zero-Knowledge Cloud Vault from Firebase
+          const fbStatus = getFirebaseStatus();
+          if (fbStatus.configured) {
+            logBackground(`Checking Firebase Cloud Vault for "${name}"...`);
+            const cloudRes = await downloadZeroKnowledgeVault(name, passphrase);
+            if (cloudRes.success && cloudRes.data) {
+              const vault = cloudRes.data;
+              restoredFromCloud = true;
+
+              // Setup local master vault with this passphrase
+              const vKey = await setupNewVault(name, passphrase);
+              vaultKeyRef.current = vKey;
+              setVaultStatus("unlocked");
+
+              // Save keys encrypted into local storage & memory
+              await savePrivateKey(name, vault.privateKeyB64, vKey);
+              privateKeyRef.current = await importPrivateKey(vault.privateKeyB64);
+              myPublicKeyB64Ref.current =
+                vault.publicKeyB64 ||
+                extractPublicKeyFromPkcs8(vault.privateKeyB64) ||
+                loadPublicKey(name);
+              if (myPublicKeyB64Ref.current) {
+                savePublicKey(name, myPublicKeyB64Ref.current);
+              }
+
+              if (vault.spkPrivateB64) {
+                await saveSpkPrivate(name, vault.spkPrivateB64, vKey);
+                spkPrivateRef.current = await importPrivateKey(
+                  vault.spkPrivateB64,
+                );
+              }
+
+              if (Array.isArray(vault.opks)) {
+                await saveOpks(name, vault.opks, vKey);
+                opksRef.current = vault.opks;
+              }
+
+              if (Array.isArray(vault.contacts)) {
+                setContacts(vault.contacts);
+              }
+
+              if (vault.ratchets && typeof vault.ratchets === "object") {
+                for (const [peer, rData] of Object.entries(vault.ratchets)) {
+                  try {
+                    const ratchet = await deserializeRatchet(rData);
+                    ratchetsByPeerRef.current.set(peer, ratchet);
+                    await saveSession(name, peer, ratchet, vKey);
+                  } catch {}
+                }
+              }
+
+              if (vault.chatHistories && typeof vault.chatHistories === "object") {
+                for (const [peer, msgs] of Object.entries(vault.chatHistories)) {
+                  if (Array.isArray(msgs)) {
+                    const chatMsgs: ChatMessage[] = msgs.map((m: any) => ({
+                      id: m.id || crypto.randomUUID(),
+                      type: m.type as "user" | "peer",
+                      text: m.text,
+                      timestamp: new Date(m.timestamp),
+                      peer: m.peer || peer,
+                    }));
+                    await saveChatHistory(name, peer, chatMsgs, vKey);
+                  }
+                }
+              }
+
+              sessionPassphraseRef.current = passphrase;
+              setHasKeys(true);
+              keysLoaded = true;
+              logBackground(
+                "✓ Zero-Knowledge Cloud Vault decrypted and restored successfully.",
+              );
+            } else if (
+              cloudRes.message &&
+              cloudRes.message.includes("Incorrect passphrase")
+            ) {
+              addCommandResult(
+                "❌ Incorrect passphrase. Unable to decrypt Zero-Knowledge Cloud Vault.",
+                activePeer ?? undefined,
+              );
+              break;
+            } else {
+              const cloudExists = await checkCloudVaultExists(name);
+              if (cloudExists) {
+                addCommandResult(
+                  `❌ Cloud vault exists for '${name}', but download failed: ${cloudRes.message}`,
+                  activePeer ?? undefined,
+                );
+                break;
+              }
+            }
+          }
+
+          // 2. Fallback to local encrypted vault if not restored from cloud
+          if (!keysLoaded) {
+            if (hasVaultConfigured(name)) {
+              const vKey = await unlockVault(name, passphrase);
+              if (!vKey) {
+                addCommandResult(
+                  "❌ Incorrect passphrase for local vault.",
+                  activePeer ?? undefined,
+                );
+                break;
+              }
+              vaultKeyRef.current = vKey;
+              setVaultStatus("unlocked");
+
+              const privB64 = await loadPrivateKey(name, vKey);
+              if (!privB64) {
+                addCommandResult(
+                  `❌ No private key found in local vault for '${name}'.`,
+                  activePeer ?? undefined,
+                );
+                break;
+              }
+              privateKeyRef.current = await importPrivateKey(privB64);
+              myPublicKeyB64Ref.current =
+                extractPublicKeyFromPkcs8(privB64) ||
+                loadPublicKey(name);
+              if (myPublicKeyB64Ref.current) {
+                savePublicKey(name, myPublicKeyB64Ref.current);
+              }
+
+              const spkB64 = await loadSpkPrivate(name, vKey);
+              if (spkB64) spkPrivateRef.current = await importPrivateKey(spkB64);
+              opksRef.current = await loadOpks(name, vKey);
+
+              sessionPassphraseRef.current = passphrase;
+              setHasKeys(true);
+              keysLoaded = true;
+              logBackground("✓ Local vault unlocked with passphrase.");
+            } else {
+              addCommandResult(
+                `❌ No vault found for '${name}' (neither in Firebase cloud nor locally).\n` +
+                  `Please run /register ${name} <passphrase> to create an identity.`,
+                activePeer ?? undefined,
+              );
+              break;
+            }
+          }
+
+          // 3. Connect to relay server
           const res = await fetch(`${getApiBase()}/api/login`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1459,55 +1977,20 @@ export default function Terminal() {
           const data = await res.json();
 
           if (!data.success) {
-            addCommandResult(`Login error: ${data.message}`, activePeer ?? undefined);
+            addCommandResult(
+              `Login error from relay: ${data.message}`,
+              activePeer ?? undefined,
+            );
             break;
           }
 
-          const privB64 = await loadPrivateKey(name, vaultKeyRef.current);
-          if (!privB64) {
-            setUsername(data.user.username);
-            if (data.user.public_key)
-              myPublicKeyB64Ref.current = data.user.public_key;
-            sendWs({ type: "auth", username: data.user.username });
-
-            const hasCloudVault = await checkCloudVaultExists(name);
-            if (hasCloudVault) {
-              addCommandResult(
-                `☁️ ZERO-KNOWLEDGE CLOUD VAULT DETECTED FOR '${data.user.username}'!\n` +
-                `────────────────────────────────────────────────────────────\n` +
-                `Your encrypted keys are backed up in Firebase.\n` +
-                `To restore your full identity, prekeys & chats on this device, run:\n\n` +
-                `   /cloud-restore ${data.user.username} <your_passphrase>`,
-                activePeer ?? undefined,
-              );
-            } else {
-              addCommandResult(
-                `⚠️ Logged in as '${data.user.username}', but NO PRIVATE KEY exists on this device/browser.\n` +
-                `────────────────────────────────────────────────────────────\n` +
-                `• Sentinel end-to-end encryption stores private keys locally on the device where you registered.\n` +
-                `• If you backed up your keys, restore with: /cloud-restore ${data.user.username} <passphrase>\n` +
-                `• Or re-register keys here: /register ${data.user.username} (or use /import-key).\n` +
-                `• Or create a distinct testing identity: /register <another_name>`,
-                activePeer ?? undefined,
-              );
-            }
-            break;
-          }
-
-          privateKeyRef.current = await importPrivateKey(privB64);
-          if (data.user.public_key)
-            myPublicKeyB64Ref.current = data.user.public_key;
-
-          const spkB64 = await loadSpkPrivate(name, vaultKeyRef.current);
-          if (spkB64) spkPrivateRef.current = await importPrivateKey(spkB64);
-          opksRef.current = await loadOpks(name, vaultKeyRef.current);
-
-          setHasKeys(true);
           setUsername(data.user.username);
+          if (data.user.public_key) {
+            myPublicKeyB64Ref.current = data.user.public_key;
+          }
 
-          // Authenticate with relay via cryptographic challenge-response
-          let token = getStoredSessionToken(data.user.username);
-          if (!token) {
+          // 4. Authenticate with relay via cryptographic challenge-response
+          if (privateKeyRef.current) {
             logBackground("Solving cryptographic challenge from relay...");
             const authRes = await authenticateWithRelay(
               getApiBase(),
@@ -1515,29 +1998,47 @@ export default function Terminal() {
               privateKeyRef.current,
             );
             if (authRes.success && authRes.token) {
-              token = authRes.token;
-              sessionTokenRef.current = token;
+              sessionTokenRef.current = authRes.token;
+              saveStoredSessionToken(data.user.username, authRes.token);
             } else {
-              addCommandResult(`⚠️ Relay challenge authentication failed: ${authRes.error}`, activePeer ?? undefined);
+              addCommandResult(
+                `⚠️ Relay challenge authentication failed: ${authRes.error}`,
+                activePeer ?? undefined,
+              );
             }
-          } else {
-            sessionTokenRef.current = token;
           }
 
-          const saved = listSavedPeers(name);
+          const saved = Array.from(
+            new Set([
+              ...listSavedPeers(name),
+              ...listSavedChatPeers(name),
+            ]),
+          );
           setContacts(saved);
-          sendWs({
-            type: "auth",
-            username: data.user.username,
-            token: sessionTokenRef.current || undefined,
-          });
+
+          authRetryCountRef.current = 0;
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            void sendWsAuth(sessionTokenRef.current || undefined);
+          } else {
+            connectWs(undefined, true);
+          }
 
           addCommandResult(
-            `✓ Logged in as ${data.user.username} [Cryptographically Authenticated].${saved.length > 0 ? ` Loaded ${saved.length} contact(s).` : " Use /new <peer> to start a chat."}`,
+            `✓ Logged in as ${data.user.username} [Cryptographically Authenticated].\n` +
+              (restoredFromCloud
+                ? `☁️ Auto-restored identity, prekeys & chat history from Firebase.\n`
+                : `🔒 Local encrypted vault unlocked.\n`) +
+              `🔄 Zero-Knowledge auto-sync active.${saved.length > 0 ? ` ${saved.length} contact(s) ready.` : " Use /new <peer> to start a chat."}`,
             activePeer ?? undefined,
           );
-        } catch {
-          addCommandResult("Failed to reach backend.", activePeer ?? undefined);
+
+          requestSync("login", 3000);
+        } catch (err: any) {
+          console.error(err);
+          addCommandResult(
+            `Login failed: ${err?.message || "Failed to reach backend."}`,
+            activePeer ?? undefined,
+          );
           setConnStatus("offline");
         }
         break;
@@ -1909,14 +2410,19 @@ export default function Terminal() {
   User:            ${username || "not registered"}
   Active chat:     ${activePeer || "none"}
   Contacts:        ${contacts.length}
-  Backend:         ${connStatus.toUpperCase()} (${serverConfigRef.current.apiUrl} [${serverConfigRef.current.source.toUpperCase()}])
+  Backend Relay:   ${serverConfigRef.current.apiUrl} [${serverConfigRef.current.source.toUpperCase()}]
+  WebSocket:       ${
+    wsRef.current?.readyState === WebSocket.OPEN
+      ? wsAuthedRef.current
+        ? "AUTHENTICATED (ONLINE)"
+        : "CONNECTED (NOT AUTHENTICATED)"
+      : "DISCONNECTED"
+  }
+  Relay Status:    ${connStatus.toUpperCase()}
   Screen Shield:   ${screenShield ? "ACTIVE (Anti-Screen Capture)" : "DISABLED"}
   Auto-Lock:       ${autoLockMinutes > 0 ? `${autoLockMinutes} min inactivity` : "OFF"}
   Encryption:      X3DH + Double Ratchet (AES-256-GCM)
-  Disappear:       ${disappearMs ? formatDuration(disappearMs) : "off"}
-  WebSocket:       ${
-    wsRef.current?.readyState === WebSocket.OPEN ? "connected" : "disconnected"
-  }`,
+  Disappear:       ${disappearMs ? formatDuration(disappearMs) : "off"}`,
           activePeer ?? undefined,
         );
         break;
@@ -1947,6 +2453,14 @@ export default function Terminal() {
         break;
 
       case "/logout":
+        if (sessionPassphraseRef.current) {
+          void triggerCloudSync("logout");
+        }
+        if (syncTimeoutRef.current) {
+          clearTimeout(syncTimeoutRef.current);
+          syncTimeoutRef.current = null;
+        }
+        sessionPassphraseRef.current = null;
         disappearTimersRef.current.forEach((t) => window.clearTimeout(t));
         disappearTimersRef.current.clear();
         setDisappearMs(null);
@@ -1955,43 +2469,118 @@ export default function Terminal() {
         setUsername(null);
         setActivePeer(null);
         setContacts([]);
+        wsAuthedRef.current = false;
         setWsAuthed(false);
+        setConnStatus(
+          wsRef.current?.readyState === WebSocket.OPEN ? "connected" : "offline",
+        );
         setHasKeys(false);
         zeroizeAllKeys();
-        addCommandResult("Logged out.", undefined);
+        addCommandResult("Logged out. Vault locked & in-memory keys purged.", undefined);
         break;
 
       case "/panic":
+        if (syncTimeoutRef.current) {
+          clearTimeout(syncTimeoutRef.current);
+          syncTimeoutRef.current = null;
+        }
+        sessionPassphraseRef.current = null;
         executePanic();
         break;
 
       case "/cloud-backup":
       case "/backup": {
         if (!username || !privateKeyRef.current) {
-          addCommandResult("You must be registered or logged in to backup keys.", activePeer ?? undefined);
+          addCommandResult(
+            "You must be registered or logged in to backup keys.",
+            activePeer ?? undefined,
+          );
           break;
         }
-        const passphrase = parts.slice(1).join(" ").trim();
+        let passphrase = parts.slice(1).join(" ").trim();
+        if (!passphrase && sessionPassphraseRef.current) {
+          passphrase = sessionPassphraseRef.current;
+        }
         if (!passphrase) {
-          addCommandResult("Usage: /cloud-backup <master_passphrase>", activePeer ?? undefined);
+          addCommandResult(
+            "Usage: /cloud-backup [passphrase]",
+            activePeer ?? undefined,
+          );
           break;
         }
-        if (passphrase.length < 6) {
-          addCommandResult("Passphrase must be at least 6 characters for cloud vault security.", activePeer ?? undefined);
+        if (passphrase.length < 8) {
+          addCommandResult(
+            "Passphrase must be at least 8 characters for cloud vault security.",
+            activePeer ?? undefined,
+          );
           break;
         }
 
-        addCommandResult("☁️ Encrypting local keys and session ratchets with PBKDF2 (600,000 iterations) + AES-256-GCM...", activePeer ?? undefined);
+        addCommandResult(
+          "☁️ Encrypting local keys, chat histories & session ratchets with PBKDF2 (600,000 iterations) + AES-256-GCM...",
+          activePeer ?? undefined,
+        );
 
         try {
           const privB64 = await exportPrivateKey(privateKeyRef.current);
-          const spkB64 = spkPrivateRef.current ? await exportPrivateKey(spkPrivateRef.current) : null;
+          const spkB64 = spkPrivateRef.current
+            ? await exportPrivateKey(spkPrivateRef.current)
+            : null;
+
+          const allPeers = Array.from(
+            new Set([
+              ...contacts,
+              ...listSavedPeers(username),
+              ...listSavedChatPeers(username),
+            ]),
+          );
 
           const ratchetsSnapshot: Record<string, any> = {};
-          for (const peer of contacts) {
-            const rawSession = localStorage.getItem(sessionStorageKey(username, peer));
-            if (rawSession) {
-              try { ratchetsSnapshot[peer] = JSON.parse(rawSession); } catch {}
+          for (const peer of allPeers) {
+            const memRatchet = ratchetsByPeerRef.current.get(peer);
+            if (memRatchet) {
+              try {
+                ratchetsSnapshot[peer] = await serializeRatchet(memRatchet);
+              } catch {}
+            } else {
+              const rawSession = localStorage.getItem(
+                sessionStorageKey(username, peer),
+              );
+              if (rawSession) {
+                try {
+                  const parsed = JSON.parse(rawSession);
+                  if (parsed.v === 2 && parsed.enc && vaultKeyRef.current) {
+                    const dec = await decryptWithVaultKey(
+                      vaultKeyRef.current,
+                      parsed.enc,
+                    );
+                    ratchetsSnapshot[peer] = JSON.parse(dec);
+                  } else {
+                    ratchetsSnapshot[peer] = parsed;
+                  }
+                } catch {}
+              }
+            }
+          }
+
+          const historiesSnapshot: Record<string, any> = {};
+          for (const peer of allPeers) {
+            const msgs = await loadChatHistory(
+              username,
+              peer,
+              vaultKeyRef.current,
+            );
+            if (msgs && msgs.length > 0) {
+              historiesSnapshot[peer] = msgs.map((m) => ({
+                id: m.id,
+                type: m.type,
+                text: m.text,
+                timestamp:
+                  m.timestamp instanceof Date
+                    ? m.timestamp.toISOString()
+                    : String(m.timestamp),
+                peer: m.peer || peer,
+              }));
             }
           }
 
@@ -2000,29 +2589,42 @@ export default function Terminal() {
             privateKeyB64: privB64,
             spkPrivateB64: spkB64,
             opks: opksRef.current,
-            contacts,
+            contacts: allPeers,
             ratchets: ratchetsSnapshot,
+            chatHistories: historiesSnapshot,
             exportedAt: new Date().toISOString(),
           };
 
-          const res = await uploadZeroKnowledgeVault(username, passphrase, payload);
+          const res = await uploadZeroKnowledgeVault(
+            username,
+            passphrase,
+            payload,
+          );
           if (res.success) {
+            sessionPassphraseRef.current = passphrase;
             addCommandResult(
               `☁️ ZERO-KNOWLEDGE CLOUD VAULT BACKUP COMPLETE!\n` +
-              `────────────────────────────────────────────────────────────\n` +
-              `Identity:       ${username}\n` +
-              `Contacts:       ${contacts.length} synced\n` +
-              `Encryption:     Client-side AES-256-GCM (Zero-Knowledge)\n` +
-              `Firebase:       Uploaded to Firestore encrypted_vaults/${username}\n\n` +
-              `You can now login from ANY device/browser by running:\n` +
-              `   /cloud-restore ${username} <passphrase>`,
+                `────────────────────────────────────────────────────────────\n` +
+                `Identity:       ${username}\n` +
+                `Contacts:       ${allPeers.length} synced\n` +
+                `Chat Histories: ${Object.keys(historiesSnapshot).length} conversations synced\n` +
+                `Encryption:     Client-side AES-256-GCM (Zero-Knowledge)\n` +
+                `Firebase:       Uploaded to Firestore encrypted_vaults/${username}\n\n` +
+                `You can now login from ANY device/browser by running:\n` +
+                `   /login ${username} <passphrase>`,
               activePeer ?? undefined,
             );
           } else {
-            addCommandResult(`❌ Cloud backup failed: ${res.message}`, activePeer ?? undefined);
+            addCommandResult(
+              `❌ Cloud backup failed: ${res.message}`,
+              activePeer ?? undefined,
+            );
           }
         } catch (err: any) {
-          addCommandResult(`❌ Backup error: ${err?.message || String(err)}`, activePeer ?? undefined);
+          addCommandResult(
+            `❌ Backup error: ${err?.message || String(err)}`,
+            activePeer ?? undefined,
+          );
         }
         break;
       }
@@ -2032,30 +2634,67 @@ export default function Terminal() {
         const targetUser = parts[1]?.toLowerCase();
         const passphrase = parts.slice(2).join(" ").trim();
         if (!targetUser || !passphrase) {
-          addCommandResult("Usage: /cloud-restore <username> <master_passphrase>", activePeer ?? undefined);
+          addCommandResult(
+            "Usage: /cloud-restore <username> <master_passphrase>",
+            activePeer ?? undefined,
+          );
+          break;
+        }
+        if (passphrase.length < 8) {
+          addCommandResult(
+            "Passphrase must be at least 8 characters.",
+            activePeer ?? undefined,
+          );
           break;
         }
 
-        addCommandResult(`☁️ Fetching Zero-Knowledge Cloud Vault for '${targetUser}' from Firebase...`, activePeer ?? undefined);
+        addCommandResult(
+          `☁️ Fetching Zero-Knowledge Cloud Vault for '${targetUser}' from Firebase...`,
+          activePeer ?? undefined,
+        );
 
         try {
           const res = await downloadZeroKnowledgeVault(targetUser, passphrase);
           if (!res.success || !res.data) {
-            addCommandResult(`❌ Cloud restore failed: ${res.message}`, activePeer ?? undefined);
+            addCommandResult(
+              `❌ Cloud restore failed: ${res.message}`,
+              activePeer ?? undefined,
+            );
             break;
           }
 
           const vault = res.data;
-          await savePrivateKey(targetUser, vault.privateKeyB64, vaultKeyRef.current);
+          const vKey = await setupNewVault(targetUser, passphrase);
+          vaultKeyRef.current = vKey;
+          setVaultStatus("unlocked");
+
+          await savePrivateKey(
+            targetUser,
+            vault.privateKeyB64,
+            vKey,
+          );
           privateKeyRef.current = await importPrivateKey(vault.privateKeyB64);
+          myPublicKeyB64Ref.current =
+            vault.publicKeyB64 ||
+            extractPublicKeyFromPkcs8(vault.privateKeyB64) ||
+            loadPublicKey(targetUser);
+          if (myPublicKeyB64Ref.current) {
+            savePublicKey(targetUser, myPublicKeyB64Ref.current);
+          }
 
           if (vault.spkPrivateB64) {
-            await saveSpkPrivate(targetUser, vault.spkPrivateB64, vaultKeyRef.current);
-            spkPrivateRef.current = await importPrivateKey(vault.spkPrivateB64);
+            await saveSpkPrivate(
+              targetUser,
+              vault.spkPrivateB64,
+              vKey,
+            );
+            spkPrivateRef.current = await importPrivateKey(
+              vault.spkPrivateB64,
+            );
           }
 
           if (Array.isArray(vault.opks)) {
-            await saveOpks(targetUser, vault.opks, vaultKeyRef.current);
+            await saveOpks(targetUser, vault.opks, vKey);
             opksRef.current = vault.opks;
           }
 
@@ -2065,26 +2704,71 @@ export default function Terminal() {
 
           if (vault.ratchets && typeof vault.ratchets === "object") {
             for (const [peer, rData] of Object.entries(vault.ratchets)) {
-              localStorage.setItem(sessionStorageKey(targetUser, peer), JSON.stringify(rData));
+              try {
+                const ratchet = await deserializeRatchet(rData);
+                ratchetsByPeerRef.current.set(peer, ratchet);
+                await saveSession(targetUser, peer, ratchet, vKey);
+              } catch {}
             }
           }
 
+          if (vault.chatHistories && typeof vault.chatHistories === "object") {
+            for (const [peer, msgs] of Object.entries(vault.chatHistories)) {
+              if (Array.isArray(msgs)) {
+                const chatMsgs: ChatMessage[] = msgs.map((m: any) => ({
+                  id: m.id || crypto.randomUUID(),
+                  type: m.type as "user" | "peer",
+                  text: m.text,
+                  timestamp: new Date(m.timestamp),
+                  peer: m.peer || peer,
+                }));
+                await saveChatHistory(targetUser, peer, chatMsgs, vKey);
+              }
+            }
+          }
+
+          sessionPassphraseRef.current = passphrase;
           setUsername(targetUser);
           setHasKeys(true);
-          sendWs({ type: "auth", username: targetUser });
+
+          if (privateKeyRef.current) {
+            logBackground("Solving cryptographic challenge from relay after cloud restore...");
+            const authRes = await authenticateWithRelay(
+              getApiBase(),
+              targetUser,
+              privateKeyRef.current,
+            );
+            if (authRes.success && authRes.token) {
+              sessionTokenRef.current = authRes.token;
+              saveStoredSessionToken(targetUser, authRes.token);
+            }
+          }
+
+          authRetryCountRef.current = 0;
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            void sendWsAuth(sessionTokenRef.current || undefined);
+          } else {
+            connectWs(undefined, true);
+          }
 
           addCommandResult(
             `☁️ ZERO-KNOWLEDGE CLOUD VAULT RESTORED SUCCESSFULLY!\n` +
-            `────────────────────────────────────────────────────────────\n` +
-            `Identity:       ${targetUser}\n` +
-            `Private Key:    Decrypted & loaded into device storage\n` +
-            `Prekeys:        Restored (${vault.opks?.length || 0} OPKs)\n` +
-            `Contacts:       ${vault.contacts?.length || 0} contact(s) restored\n\n` +
-            `✓ WebSocket authenticated. Ready to chat securely from this device!`,
+              `────────────────────────────────────────────────────────────\n` +
+              `Identity:       ${targetUser}\n` +
+              `Private Key:    Decrypted & loaded into device storage\n` +
+              `Prekeys:        Restored (${vault.opks?.length || 0} OPKs)\n` +
+              `Contacts:       ${vault.contacts?.length || 0} contact(s) restored\n` +
+              `Chat Histories: ${Object.keys(vault.chatHistories || {}).length} conversation(s) restored\n\n` +
+              `✓ WebSocket authenticated. Ready to chat securely from this device!`,
             activePeer ?? undefined,
           );
+
+          requestSync("restore", 3000);
         } catch (err: any) {
-          addCommandResult(`❌ Cloud restore error: ${err?.message || String(err)}`, activePeer ?? undefined);
+          addCommandResult(
+            `❌ Cloud restore error: ${err?.message || String(err)}`,
+            activePeer ?? undefined,
+          );
         }
         break;
       }
@@ -2214,8 +2898,11 @@ export default function Terminal() {
             `No session with ${activePeer}. Use /new ${activePeer} first.`,
             activePeer,
           );
-        } else if (!wsAuthed) {
-          addCommandResult("WebSocket not authenticated yet. Connecting...", activePeer);
+        } else if (!wsAuthed || connStatus !== "online") {
+          addCommandResult(
+            "WebSocket not authenticated on relay yet. Run /login or wait for connection.",
+            activePeer,
+          );
         } else {
           try {
             const state = ratchetRef.current;
@@ -2439,13 +3126,25 @@ export default function Terminal() {
               className={`text-[11px] font-semibold px-2 py-0.5 rounded border flex items-center gap-1.5 ${
                 connStatus === "online"
                   ? "text-[#00ff66] bg-[#00ff66]/10 border-[#00ff66]/30"
-                  : connStatus === "connecting"
-                    ? "text-[#ffb000] bg-[#ffb000]/10 border-[#ffb000]/30"
-                    : "text-[#ff4444] bg-[#ff4444]/10 border-[#ff4444]/30"
+                  : connStatus === "connected"
+                    ? "text-[#00e5ff] bg-[#00e5ff]/10 border-[#00e5ff]/30"
+                    : connStatus === "connecting"
+                      ? "text-[#ffb000] bg-[#ffb000]/10 border-[#ffb000]/30"
+                      : connStatus === "auth_failed"
+                        ? "text-[#ff0055] bg-[#ff0055]/10 border-[#ff0055]/30"
+                        : "text-[#ff4444] bg-[#ff4444]/10 border-[#ff4444]/30"
               }`}
             >
               <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
-              {connStatus.toUpperCase()}
+              {connStatus === "online"
+                ? "ONLINE"
+                : connStatus === "connected"
+                  ? "CONNECTED (UNAUTHED)"
+                  : connStatus === "auth_failed"
+                    ? "AUTH FAILED"
+                    : connStatus === "connecting"
+                      ? "CONNECTING..."
+                      : "OFFLINE"}
             </span>
 
             <button
@@ -2763,11 +3462,14 @@ export default function Terminal() {
                   End-to-End Encrypted Terminal • Forward Secrecy • Zero Plaintext Storage
                 </div>
                 <div className="text-xs text-[#006622] max-w-md leading-relaxed font-mono">
-                  Select a contact on the left or type{" "}
+                  Login with{" "}
                   <code className="text-[#00ff66] bg-[#00220a] px-1 py-0.5 rounded border border-[#004414]">
-                    /new &lt;username&gt;
+                    /login &lt;user&gt; &lt;passphrase&gt;
                   </code>{" "}
-                  to establish a post-compromise secure session.
+                  or create an identity with{" "}
+                  <code className="text-[#00ff66] bg-[#00220a] px-1 py-0.5 rounded border border-[#004414]">
+                    /register &lt;user&gt; &lt;passphrase&gt;
+                  </code>
                 </div>
                 <div className="flex flex-wrap justify-center gap-2 pt-2">
                   <button
@@ -2873,7 +3575,7 @@ export default function Terminal() {
             { label: "/verify 🛡️", cmd: "/verify" },
             { label: "/disappear 5m ⏱️", cmd: "/disappear 5m" },
             { label: "/status ⚡", cmd: "/status" },
-            { label: "/backup ☁️", cmd: "/cloud-backup " },
+            { label: "/backup ☁️", cmd: "/cloud-backup" },
             { label: "/restore ☁️", cmd: "/cloud-restore " },
             { label: "/chats 👥", cmd: "/chats" },
             { label: "/shield 🛡️", cmd: "/shield" },
@@ -2911,7 +3613,7 @@ export default function Terminal() {
                 ? disappearMs
                   ? `Message ${activePeer} (TTL ${formatDuration(disappearMs)})... or type /command`
                   : `Message ${activePeer}... or type /command`
-                : "Type a command e.g. /new <user>, /help, /chats..."
+                : "Type a command e.g. /login <user> <pass>, /register <user> <pass>, /help..."
             }
             spellCheck={false}
             autoComplete="off"
@@ -2936,7 +3638,15 @@ export default function Terminal() {
         <div className="px-4 py-1 text-[10px] text-[#004414] flex justify-between select-none shrink-0 bg-[#020703] border-t border-[#00220a]">
           <span className="flex items-center gap-2">
             <span>
-              {connStatus === "online" ? "BACKEND ONLINE" : "BACKEND OFFLINE"}
+              {connStatus === "online"
+                ? "RELAY AUTHENTICATED (ONLINE)"
+                : connStatus === "connected"
+                  ? "RELAY CONNECTED (NOT AUTHENTICATED)"
+                  : connStatus === "auth_failed"
+                    ? "RELAY AUTH FAILED"
+                    : connStatus === "connecting"
+                      ? "RELAY CONNECTING..."
+                      : "RELAY OFFLINE"}
             </span>
             <span>•</span>
             <span>X3DH + DOUBLE RATCHET + AES-GCM</span>

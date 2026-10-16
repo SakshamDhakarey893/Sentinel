@@ -982,6 +982,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             };
 
                             if !exists {
+                                if let Some(prev) = authed_user.take() {
+                                    let mut conns = recv_state.connections.lock().await;
+                                    if let Some(existing) = conns.get(&prev) {
+                                        if existing.same_channel(&tx) {
+                                            conns.remove(&prev);
+                                        }
+                                    }
+                                }
                                 let err = serde_json::json!({
                                     "type": "auth_error",
                                     "message": format!("Unknown user '{}'. Register first.", username)
@@ -999,6 +1007,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             };
 
                             if !token_valid {
+                                if let Some(prev) = authed_user.take() {
+                                    let mut conns = recv_state.connections.lock().await;
+                                    if let Some(existing) = conns.get(&prev) {
+                                        if existing.same_channel(&tx) {
+                                            conns.remove(&prev);
+                                        }
+                                    }
+                                }
                                 let err = serde_json::json!({
                                     "type": "auth_error",
                                     "message": "Cryptographic authentication failed. Valid session token required."
@@ -1009,15 +1025,26 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                             {
                                 let mut conns = recv_state.connections.lock().await;
+                                if let Some(ref prev) = authed_user {
+                                    if prev != &username {
+                                        if let Some(existing) = conns.get(prev) {
+                                            if existing.same_channel(&tx) {
+                                                conns.remove(prev);
+                                            }
+                                        }
+                                    }
+                                }
                                 conns.insert(username.clone(), tx.clone());
                             }
 
                             authed_user = Some(username.clone());
                             tracing::info!("WS auth: {}", username);
 
+                            let online = recv_state.connections.lock().await.len();
                             let ok = serde_json::json!({
                                 "type": "auth_ok",
                                 "username": username,
+                                "users_authenticated": online,
                                 "message": "Authenticated on WebSocket"
                             });
                             let _ = tx.send(ok.to_string());
@@ -1168,8 +1195,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
         if let Some(user) = authed_user {
             let mut conns = recv_state.connections.lock().await;
-            conns.remove(&user);
-            tracing::info!("WS disconnect: {}", user);
+            if let Some(existing) = conns.get(&user) {
+                if existing.same_channel(&tx) {
+                    conns.remove(&user);
+                    tracing::info!("WS disconnect: {}", user);
+                }
+            }
         }
     });
 
