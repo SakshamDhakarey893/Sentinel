@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: sentinel-relay
+    runtime: docker
+    dockerfilePath: backend/Dockerfile
+    dockerContext: backend
+    plan: free
+    region: oregon
+    envVars:
+      - key: RUST_LOG
+        value: sentinel_backend=info,tower_http=info
+    healthCheckPath: /health

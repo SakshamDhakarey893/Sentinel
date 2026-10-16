@@ -50,10 +50,10 @@ ENV PORT=8080
 ENV DATABASE_PATH=/app/data/sentinel.db
 ENV RUST_LOG=sentinel_backend=info,tower_http=info
 
-EXPOSE 8080
+EXPOSE 8080 10000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD curl -f http://127.0.0.1:8080/health || exit 1
+  CMD sh -c "curl -f http://127.0.0.1:\${PORT:-8080}/health || exit 1"
 
 VOLUME ["/app/data"]
 
