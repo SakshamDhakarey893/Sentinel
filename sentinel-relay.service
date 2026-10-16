@@ -1,0 +1,25 @@
+[Unit]
+Description=Sentinel End-to-End Encrypted Messaging Relay Server
+After=network.target
+
+[Service]
+Type=simple
+User=sentinel
+Group=sentinel
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/sentinel-backend
+Restart=always
+RestartSec=5s
+Environment=HOST=0.0.0.0
+Environment=PORT=8080
+Environment=DATABASE_PATH=/opt/sentinel/data/sentinel.db
+Environment=RUST_LOG=sentinel_backend=info,tower_http=info
+
+# Hardening / Sandboxing
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

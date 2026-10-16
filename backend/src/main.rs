@@ -253,8 +253,12 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let conn = match db::init_db(db::DB_PATH) {
-        Ok(c) => c,
+    let db_path = db::get_db_path();
+    let conn = match db::init_db(&db_path) {
+        Ok(c) => {
+            tracing::info!("SQLite persistence initialized at: {}", db_path);
+            c
+        }
         Err(e) => {
             tracing::error!("Fatal: Failed to initialize SQLite database: {}", e);
             std::process::exit(1);
@@ -288,7 +292,14 @@ async fn main() {
         .layer(cors)
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+    let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(8080);
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 8080)));
     tracing::info!("Sentinel backend listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();

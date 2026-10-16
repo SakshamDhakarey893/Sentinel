@@ -1,0 +1,29 @@
+{
+    # Global options
+    admin off
+    email {$CONTACT_EMAIL:admin@localhost}
+}
+
+# The relay server domain (e.g., relay.yourdomain.com or localhost)
+{$DOMAIN:localhost} {
+    # Automatic HTTPS, TLS certificates, and WebSocket reverse proxying
+    reverse_proxy sentinel-backend:8080 {
+        # Instant WebSocket and streaming flush
+        flush_interval -1
+    }
+
+    # Security Headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+        Server "Sentinel-Relay"
+    }
+
+    # Access logs
+    log {
+        output stdout
+        format console
+    }
+}

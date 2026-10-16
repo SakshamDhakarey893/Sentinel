@@ -126,6 +126,7 @@ You can point the Sentinel frontend or desktop app to any local or remote relay 
 - [x] Dynamic server configuration (environment variables & runtime `/server` command)
 - [x] Cryptographic challenge-response authentication on relay (ECDH + HMAC-SHA256 zero-knowledge proof)
 - [x] Embedded SQLite database persistence (WAL mode, atomic one-time prekey consumption, auto-migration)
+- [x] 24/7 Production Deployment stack (Docker Compose, Caddy auto-TLS reverse proxy, systemd, Windows background auto-start)
 
 ## License
 

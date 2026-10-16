@@ -4,6 +4,11 @@ use std::fs;
 use std::path::Path;
 
 pub const DB_PATH: &str = "data/sentinel.db";
+
+pub fn get_db_path() -> String {
+    std::env::var("DATABASE_PATH").unwrap_or_else(|_| DB_PATH.to_string())
+}
+
 const LEGACY_USERS_FILE: &str = "data/users.json";
 const LEGACY_QUEUE_FILE: &str = "data/queue.json";
 
