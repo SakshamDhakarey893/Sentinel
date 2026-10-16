@@ -34,3 +34,8 @@ p256 = { version = "0.13", features = ["ecdh", "pkcs8"] }
 hmac = "0.12"
 sha2 = "0.10"
 
+# Database Persistence
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+
+

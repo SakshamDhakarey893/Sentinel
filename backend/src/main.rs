@@ -12,34 +12,30 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
+use p256::elliptic_curve::subtle::ConstantTimeEq;
 use p256::pkcs8::{DecodePublicKey, EncodePublicKey};
 use p256::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{
     collections::HashMap,
-    fs,
     net::SocketAddr,
-    path::Path,
     sync::Arc,
     time::Instant,
 };
-use p256::elliptic_curve::subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, Mutex};
 use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
-const USERS_FILE: &str = "data/users.json";
-const QUEUE_FILE: &str = "data/queue.json";
+mod db;
+use db::{QueuedMessage, User};
 
 #[derive(Clone)]
 struct AppState {
-    users: Arc<Mutex<HashMap<String, User>>>,
+    db: Arc<Mutex<rusqlite::Connection>>,
     connections: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
-    queue: Arc<Mutex<HashMap<String, Vec<QueuedMessage>>>>,
     challenges: Arc<Mutex<HashMap<String, PendingChallenge>>>,
-    sessions: Arc<Mutex<HashMap<String, ActiveSession>>>,
 }
 
 #[derive(Clone)]
@@ -47,31 +43,6 @@ struct PendingChallenge {
     username: String,
     expected_response: Vec<u8>,
     created_at: Instant,
-}
-
-#[derive(Clone)]
-struct ActiveSession {
-    username: String,
-    #[allow(dead_code)]
-    created_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct User {
-    id: String,
-    username: String,
-    created_at: String,
-    public_key: Option<String>,          // Identity public key (SPKI base64)
-    signed_prekey: Option<String>,       // Signed prekey public (SPKI base64)
-    one_time_prekeys: Vec<String>,       // One-time prekey publics
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct QueuedMessage {
-    from: String,
-    to: String,
-    text: String,
-    ts: String,
 }
 
 #[derive(Deserialize)]
@@ -181,7 +152,7 @@ struct PrekeyBundleResponse {
     username: String,
     identity_key: Option<String>,
     signed_prekey: Option<String>,
-    one_time_prekey: Option<String>, // consumed if present
+    one_time_prekey: Option<String>, // consumed atomically if present
     opks_remaining: usize,
     message: String,
 }
@@ -266,70 +237,8 @@ async fn verify_user_session(
         None => return false,
     };
 
-    let sessions = state.sessions.lock().await;
-    match sessions.get(&token) {
-        Some(session) => session.username.eq_ignore_ascii_case(username),
-        None => false,
-    }
-}
-
-
-// ─── Persistence ────────────────────────────────────────────────────────────
-
-fn load_users() -> HashMap<String, User> {
-    if !Path::new(USERS_FILE).exists() {
-        return HashMap::new();
-    }
-    match fs::read_to_string(USERS_FILE) {
-        Ok(content) => match serde_json::from_str::<HashMap<String, User>>(&content) {
-            Ok(map) => {
-                tracing::info!("Loaded {} users from disk", map.len());
-                map
-            }
-            Err(e) => {
-                tracing::error!("Failed to parse users file: {}", e);
-                HashMap::new()
-            }
-        },
-        Err(e) => {
-            tracing::error!("Failed to read users file: {}", e);
-            HashMap::new()
-        }
-    }
-}
-
-fn save_users(users: &HashMap<String, User>) {
-    if let Some(parent) = Path::new(USERS_FILE).parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(users) {
-        let _ = fs::write(USERS_FILE, json);
-    }
-}
-
-fn load_queue() -> HashMap<String, Vec<QueuedMessage>> {
-    if !Path::new(QUEUE_FILE).exists() {
-        return HashMap::new();
-    }
-    match fs::read_to_string(QUEUE_FILE) {
-        Ok(content) => match serde_json::from_str(&content) {
-            Ok(map) => {
-                tracing::info!("Loaded offline queue from disk");
-                map
-            }
-            Err(_) => HashMap::new(),
-        },
-        Err(_) => HashMap::new(),
-    }
-}
-
-fn save_queue(queue: &HashMap<String, Vec<QueuedMessage>>) {
-    if let Some(parent) = Path::new(QUEUE_FILE).parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(queue) {
-        let _ = fs::write(QUEUE_FILE, json);
-    }
+    let db = state.db.lock().await;
+    db::verify_session(&db, &token, username).unwrap_or(false)
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -344,15 +253,18 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let users = load_users();
-    let queue = load_queue();
+    let conn = match db::init_db(db::DB_PATH) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Fatal: Failed to initialize SQLite database: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     let state = AppState {
-        users: Arc::new(Mutex::new(users)),
+        db: Arc::new(Mutex::new(conn)),
         connections: Arc::new(Mutex::new(HashMap::new())),
-        queue: Arc::new(Mutex::new(queue)),
         challenges: Arc::new(Mutex::new(HashMap::new())),
-        sessions: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let cors = CorsLayer::new()
@@ -384,15 +296,18 @@ async fn main() {
 }
 
 async fn root() -> &'static str {
-    "Sentinel Backend v0.2.0 — Secure Messaging API (Prekeys + X3DH)"
+    "Sentinel Backend v0.3.0 — Secure Messaging API (SQLite Persistence + X3DH + ECDH Auth)"
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
-    let registered = state.users.lock().await.len();
+    let registered = {
+        let db = state.db.lock().await;
+        db::count_users(&db).unwrap_or(0)
+    };
     let online = state.connections.lock().await.len();
     Json(HealthResponse {
         status: "ok".into(),
-        version: "0.2.0".into(),
+        version: "0.3.0".into(),
         users_registered: registered,
         users_online: online,
     })
@@ -403,24 +318,36 @@ async fn create_challenge(
     Json(payload): Json<ChallengeRequest>,
 ) -> impl IntoResponse {
     let username = payload.username.trim().to_lowercase();
-    let users = state.users.lock().await;
-
-    let user = match users.get(&username) {
-        Some(u) => u.clone(),
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ChallengeResponse {
-                    success: false,
-                    message: format!("User '{}' not found", username),
-                    challenge_id: None,
-                    server_ephemeral_pub: None,
-                    nonce: None,
-                }),
-            );
+    let user = {
+        let db = state.db.lock().await;
+        match db::get_user(&db, &username) {
+            Ok(Some(u)) => u,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(ChallengeResponse {
+                        success: false,
+                        message: format!("User '{}' not found", username),
+                        challenge_id: None,
+                        server_ephemeral_pub: None,
+                        nonce: None,
+                    }),
+                );
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ChallengeResponse {
+                        success: false,
+                        message: format!("Database error: {}", e),
+                        challenge_id: None,
+                        server_ephemeral_pub: None,
+                        nonce: None,
+                    }),
+                );
+            }
         }
     };
-    drop(users);
 
     let pubkey_b64 = match user.public_key {
         Some(ref pk) if !pk.is_empty() => pk.clone(),
@@ -557,14 +484,12 @@ async fn verify_challenge(
     }
 
     let token = Uuid::new_v4().to_string();
-    let mut sessions = state.sessions.lock().await;
-    sessions.insert(
-        token.clone(),
-        ActiveSession {
-            username: username.clone(),
-            created_at: chrono::Utc::now(),
-        },
-    );
+    {
+        let db = state.db.lock().await;
+        if let Err(e) = db::save_session(&db, &token, &username) {
+            tracing::error!("Failed to save session to DB: {}", e);
+        }
+    }
 
     tracing::info!("User '{}' authenticated via challenge-response. Token issued.", username);
 
@@ -613,13 +538,14 @@ async fn register(
         );
     }
 
-    let mut users = state.users.lock().await;
-    let existing_id = users.get(&username).map(|u| u.id.clone());
-    let is_update = existing_id.is_some();
+    let existing_user = {
+        let db = state.db.lock().await;
+        db::get_user(&db, &username).ok().flatten()
+    };
+    let is_update = existing_user.is_some();
 
     // If updating existing user keys, cryptographic authentication is strictly required
     if is_update {
-        drop(users);
         let authorized = verify_user_session(&state, &username, &headers, payload.token.as_deref()).await;
         if !authorized {
             return (
@@ -632,32 +558,33 @@ async fn register(
                 }),
             );
         }
-        users = state.users.lock().await;
     }
 
     let user = User {
-        id: existing_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        id: existing_user.as_ref().map(|u| u.id.clone()).unwrap_or_else(|| Uuid::new_v4().to_string()),
         username: username.clone(),
-        created_at: chrono::Utc::now().to_rfc3339(),
+        created_at: existing_user.as_ref().map(|u| u.created_at.clone()).unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
         public_key: payload.public_key,
-        signed_prekey: None,
+        signed_prekey: existing_user.as_ref().and_then(|u| u.signed_prekey.clone()),
         one_time_prekeys: vec![],
     };
 
-    users.insert(username.clone(), user.clone());
-    save_users(&users);
-    drop(users);
-
-    // Issue initial session token for user
     let token = Uuid::new_v4().to_string();
-    let mut sessions = state.sessions.lock().await;
-    sessions.insert(
-        token.clone(),
-        ActiveSession {
-            username: username.clone(),
-            created_at: chrono::Utc::now(),
-        },
-    );
+    {
+        let db = state.db.lock().await;
+        if let Err(e) = db::save_user(&db, &user) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(RegisterResponse {
+                    success: false,
+                    message: format!("Failed to save user: {}", e),
+                    user: None,
+                    token: None,
+                }),
+            );
+        }
+        let _ = db::save_session(&db, &token, &username);
+    }
 
     if is_update {
         tracing::info!("User identity re-registered / key rotated: {}", user.username);
@@ -685,9 +612,12 @@ async fn login(
     Json(payload): Json<LoginRequest>,
 ) -> impl IntoResponse {
     let username = payload.username.trim().to_lowercase();
-    let users = state.users.lock().await;
+    let user_opt = {
+        let db = state.db.lock().await;
+        db::get_user(&db, &username).ok().flatten()
+    };
 
-    match users.get(&username) {
+    match user_opt {
         Some(user) => {
             tracing::info!("User login query: {}", user.username);
             let requires_challenge = user.public_key.is_some();
@@ -700,7 +630,7 @@ async fn login(
                     } else {
                         "Login successful".into()
                     },
-                    user: Some(user.clone()),
+                    user: Some(user),
                     requires_challenge,
                 }),
             )
@@ -725,15 +655,18 @@ async fn get_public_key(
     axum::extract::Path(username): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     let username = username.trim().to_lowercase();
-    let users = state.users.lock().await;
+    let user_opt = {
+        let db = state.db.lock().await;
+        db::get_user(&db, &username).ok().flatten()
+    };
 
-    match users.get(&username) {
+    match user_opt {
         Some(user) => (
             StatusCode::OK,
             Json(PublicKeyResponse {
                 success: true,
-                username: user.username.clone(),
-                public_key: user.public_key.clone(),
+                username: user.username,
+                public_key: user.public_key,
             }),
         ),
         None => (
@@ -765,33 +698,47 @@ async fn upload_prekeys(
         );
     }
 
-    let mut users = state.users.lock().await;
+    let mut db = state.db.lock().await;
+    match db::get_user(&db, &username) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(UploadPrekeysResponse {
+                    success: false,
+                    message: format!("User '{}' not found", username),
+                }),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(UploadPrekeysResponse {
+                    success: false,
+                    message: format!("Database error: {}", e),
+                }),
+            );
+        }
+    }
 
-    if let Some(user) = users.get_mut(&username) {
-        user.signed_prekey = Some(payload.signed_prekey);
-        user.one_time_prekeys = payload.one_time_prekeys;
-        let count = user.one_time_prekeys.len();
-        let name = user.username.clone();
-
-        // Mutable borrow ends here
-        save_users(&users);
-
-        tracing::info!("Prekeys uploaded for {} ({} one-time)", name, count);
-        (
-            StatusCode::OK,
-            Json(UploadPrekeysResponse {
-                success: true,
-                message: "Prekeys uploaded".into(),
-            }),
-        )
-    } else {
-        (
-            StatusCode::NOT_FOUND,
+    match db::replace_prekeys(&mut *db, &username, &payload.signed_prekey, &payload.one_time_prekeys) {
+        Ok(count) => {
+            tracing::info!("Prekeys uploaded for {} ({} one-time)", username, count);
+            (
+                StatusCode::OK,
+                Json(UploadPrekeysResponse {
+                    success: true,
+                    message: "Prekeys uploaded".into(),
+                }),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(UploadPrekeysResponse {
                 success: false,
-                message: format!("User '{}' not found", username),
+                message: format!("Failed to replace prekeys: {}", e),
             }),
-        )
+        ),
     }
 }
 
@@ -813,32 +760,49 @@ async fn append_prekeys(
         );
     }
 
-    let mut users = state.users.lock().await;
+    let db = state.db.lock().await;
+    match db::get_user(&db, &username) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(UploadPrekeysResponse {
+                    success: false,
+                    message: format!("User '{}' not found", username),
+                }),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(UploadPrekeysResponse {
+                    success: false,
+                    message: format!("Database error: {}", e),
+                }),
+            );
+        }
+    }
 
-    if let Some(user) = users.get_mut(&username) {
-        let added = payload.one_time_prekeys.len();
-        user.one_time_prekeys.extend(payload.one_time_prekeys);
-        let total = user.one_time_prekeys.len();
-        let name = user.username.clone();
-
-        save_users(&users);
-
-        tracing::info!("Appended {} prekeys for {} (total: {})", added, name, total);
-        (
-            StatusCode::OK,
-            Json(UploadPrekeysResponse {
-                success: true,
-                message: format!("Appended {} prekeys (pool size: {})", added, total),
-            }),
-        )
-    } else {
-        (
-            StatusCode::NOT_FOUND,
+    let added = payload.one_time_prekeys.len();
+    match db::append_one_time_prekeys(&db, &username, &payload.one_time_prekeys) {
+        Ok(_) => {
+            let total = db::count_one_time_prekeys(&db, &username).unwrap_or(0);
+            tracing::info!("Appended {} prekeys for {} (total: {})", added, username, total);
+            (
+                StatusCode::OK,
+                Json(UploadPrekeysResponse {
+                    success: true,
+                    message: format!("Appended {} prekeys (pool size: {})", added, total),
+                }),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(UploadPrekeysResponse {
                 success: false,
-                message: format!("User '{}' not found", username),
+                message: format!("Failed to append prekeys: {}", e),
             }),
-        )
+        ),
     }
 }
 
@@ -847,19 +811,22 @@ async fn get_prekeys_count(
     axum::extract::Path(username): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     let username = username.trim().to_lowercase();
-    let users = state.users.lock().await;
+    let db = state.db.lock().await;
 
-    match users.get(&username) {
-        Some(user) => (
-            StatusCode::OK,
-            Json(PrekeysCountResponse {
-                success: true,
-                username: user.username.clone(),
-                count: user.one_time_prekeys.len(),
-                signed_prekey_present: user.signed_prekey.is_some(),
-            }),
-        ),
-        None => (
+    match db::get_user(&db, &username) {
+        Ok(Some(user)) => {
+            let count = db::count_one_time_prekeys(&db, &username).unwrap_or(0);
+            (
+                StatusCode::OK,
+                Json(PrekeysCountResponse {
+                    success: true,
+                    username: user.username,
+                    count,
+                    signed_prekey_present: user.signed_prekey.is_some(),
+                }),
+            )
+        }
+        _ => (
             StatusCode::NOT_FOUND,
             Json(PrekeysCountResponse {
                 success: false,
@@ -876,68 +843,70 @@ async fn get_prekey_bundle(
     axum::extract::Path(username): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     let username = username.trim().to_lowercase();
-    let mut users = state.users.lock().await;
+    let db = state.db.lock().await;
 
-    let result = if let Some(user) = users.get_mut(&username) {
-        if user.public_key.is_none() || user.signed_prekey.is_none() {
-            Some(Err(()))
-        } else {
-            let identity_key = user.public_key.clone();
-            let signed_prekey = user.signed_prekey.clone();
-            let one_time_prekey = if !user.one_time_prekeys.is_empty() {
-                Some(user.one_time_prekeys.remove(0))
-            } else {
-                None
-            };
-            let opks_remaining = user.one_time_prekeys.len();
-            let name = user.username.clone();
-            Some(Ok((name, identity_key, signed_prekey, one_time_prekey, opks_remaining)))
+    let user = match db::get_user(&db, &username) {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(PrekeyBundleResponse {
+                    success: false,
+                    username,
+                    identity_key: None,
+                    signed_prekey: None,
+                    one_time_prekey: None,
+                    opks_remaining: 0,
+                    message: "User not found".into(),
+                }),
+            );
         }
-    } else {
-        None
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PrekeyBundleResponse {
+                    success: false,
+                    username,
+                    identity_key: None,
+                    signed_prekey: None,
+                    one_time_prekey: None,
+                    opks_remaining: 0,
+                    message: format!("Database error: {}", e),
+                }),
+            );
+        }
     };
 
-    match result {
-        Some(Ok((name, identity_key, signed_prekey, one_time_prekey, opks_remaining))) => {
-            save_users(&users);
-            (
-                StatusCode::OK,
-                Json(PrekeyBundleResponse {
-                    success: true,
-                    username: name,
-                    identity_key,
-                    signed_prekey,
-                    one_time_prekey,
-                    opks_remaining,
-                    message: "Prekey bundle ready".into(),
-                }),
-            )
-        }
-        Some(Err(())) => (
+    if user.public_key.is_none() || user.signed_prekey.is_none() {
+        return (
             StatusCode::BAD_REQUEST,
             Json(PrekeyBundleResponse {
                 success: false,
-                username: username.clone(),
+                username: user.username,
                 identity_key: None,
                 signed_prekey: None,
                 one_time_prekey: None,
                 opks_remaining: 0,
                 message: "User has no prekeys uploaded yet".into(),
             }),
-        ),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(PrekeyBundleResponse {
-                success: false,
-                username,
-                identity_key: None,
-                signed_prekey: None,
-                one_time_prekey: None,
-                opks_remaining: 0,
-                message: "User not found".into(),
-            }),
-        ),
+        );
     }
+
+    let one_time_prekey = db::consume_one_time_prekey(&db, &username).unwrap_or(None);
+    let opks_remaining = db::count_one_time_prekeys(&db, &username).unwrap_or(0);
+
+    (
+        StatusCode::OK,
+        Json(PrekeyBundleResponse {
+            success: true,
+            username: user.username,
+            identity_key: user.public_key,
+            signed_prekey: user.signed_prekey,
+            one_time_prekey,
+            opks_remaining,
+            message: "Prekey bundle ready".into(),
+        }),
+    )
 }
 
 // ─── WebSocket ──────────────────────────────────────────────────────────────
@@ -969,8 +938,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     match serde_json::from_str::<ClientMsg>(&text) {
                         Ok(ClientMsg::Auth { username, token }) => {
                             let username = username.trim().to_lowercase();
-                            let users = recv_state.users.lock().await;
-                            if !users.contains_key(&username) {
+                            let exists = {
+                                let db = recv_state.db.lock().await;
+                                db::get_user(&db, &username).ok().flatten().is_some()
+                            };
+
+                            if !exists {
                                 let err = serde_json::json!({
                                     "type": "auth_error",
                                     "message": format!("Unknown user '{}'. Register first.", username)
@@ -978,18 +951,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 let _ = tx.send(err.to_string());
                                 continue;
                             }
-                            drop(users);
 
                             // Verify cryptographic session token
-                            let mut token_valid = false;
-                            if let Some(ref t) = token {
-                                let sessions = recv_state.sessions.lock().await;
-                                if let Some(session) = sessions.get(t) {
-                                    if session.username.eq_ignore_ascii_case(&username) {
-                                        token_valid = true;
-                                    }
-                                }
-                            }
+                            let token_valid = if let Some(ref t) = token {
+                                let db = recv_state.db.lock().await;
+                                db::verify_session(&db, t, &username).unwrap_or(false)
+                            } else {
+                                false
+                            };
 
                             if !token_valid {
                                 let err = serde_json::json!({
@@ -1016,35 +985,35 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             let _ = tx.send(ok.to_string());
 
                             // Deliver queued offline messages
-                            let mut queue = recv_state.queue.lock().await;
-                            if let Some(pending) = queue.remove(&username) {
-                                let count = pending.len();
-                                if count > 0 {
-                                    tracing::info!(
-                                        "Delivering {} queued messages to {}",
-                                        count,
-                                        username
-                                    );
-                                    let info = serde_json::json!({
-                                        "type": "system",
-                                        "message": format!("Delivering {} offline message(s)...", count)
-                                    });
-                                    let _ = tx.send(info.to_string());
+                            let pending = {
+                                let db = recv_state.db.lock().await;
+                                db::pop_queued_messages(&db, &username).unwrap_or_default()
+                            };
 
-                                    for qm in pending {
-                                        let payload = serde_json::json!({
-                                            "type": "message",
-                                            "from": qm.from,
-                                            "to": qm.to,
-                                            "text": qm.text,
-                                            "ts": qm.ts
-                                        });
-                                        let _ = tx.send(payload.to_string());
-                                    }
-                                    save_queue(&queue);
+                            if !pending.is_empty() {
+                                let count = pending.len();
+                                tracing::info!(
+                                    "Delivering {} queued messages to {}",
+                                    count,
+                                    username
+                                );
+                                let info = serde_json::json!({
+                                    "type": "system",
+                                    "message": format!("Delivering {} offline message(s)...", count)
+                                });
+                                let _ = tx.send(info.to_string());
+
+                                for qm in pending {
+                                    let payload = serde_json::json!({
+                                        "type": "message",
+                                        "from": qm.from,
+                                        "to": qm.to,
+                                        "text": qm.text,
+                                        "ts": qm.ts
+                                    });
+                                    let _ = tx.send(payload.to_string());
                                 }
                             }
-                            drop(queue);
 
                             let online = recv_state.connections.lock().await.len();
                             let info = serde_json::json!({
@@ -1081,16 +1050,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 continue;
                             }
 
-                            {
-                                let users = recv_state.users.lock().await;
-                                if !users.contains_key(&to) {
-                                    let err = serde_json::json!({
-                                        "type": "system",
-                                        "message": format!("User '{}' does not exist.", to)
-                                    });
-                                    let _ = tx.send(err.to_string());
-                                    continue;
-                                }
+                            let recipient_exists = {
+                                let db = recv_state.db.lock().await;
+                                db::get_user(&db, &to).ok().flatten().is_some()
+                            };
+
+                            if !recipient_exists {
+                                let err = serde_json::json!({
+                                    "type": "system",
+                                    "message": format!("User '{}' does not exist.", to)
+                                });
+                                let _ = tx.send(err.to_string());
+                                continue;
                             }
 
                             let payload = serde_json::json!({
@@ -1126,9 +1097,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 };
 
                                 {
-                                    let mut queue = recv_state.queue.lock().await;
-                                    queue.entry(to.clone()).or_default().push(qm);
-                                    save_queue(&queue);
+                                    let db = recv_state.db.lock().await;
+                                    if let Err(e) = db::enqueue_message(&db, &qm) {
+                                        tracing::error!("Failed to enqueue offline message: {}", e);
+                                    }
                                 }
 
                                 let info = serde_json::json!({
