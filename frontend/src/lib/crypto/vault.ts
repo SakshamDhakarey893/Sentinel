@@ -270,7 +270,10 @@ export async function saveChatHistory(
   try {
     const toStore: StoredMessage[] = messages
       .filter(
-        (m) => (m.type === "user" || m.type === "peer") && m.peer === peer,
+        (m) =>
+          (m.type === "user" || m.type === "peer") &&
+          m.peer === peer &&
+          !m.isCmdResult,
       )
       .map((m) => ({
         id: m.id,

@@ -113,7 +113,7 @@ export default function Terminal() {
   const [wsAuthed, setWsAuthed] = useState(false);
   const [hasKeys, setHasKeys] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [logOpen, setLogOpen] = useState(false);
+  const [logOpen, setLogOpen] = useState(true);
   const [disappearMs, setDisappearMs] = useState<number | null>(null);
   const [vaultStatus, setVaultStatus] = useState<
     "locked" | "unlocked" | "shredded" | "none"
@@ -133,6 +133,7 @@ export default function Terminal() {
   );
 
   const bottomRef = useRef<HTMLDivElement>(null);
+  const consoleBottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const usernameRef = useRef<string | null>(null);
@@ -167,6 +168,11 @@ export default function Terminal() {
 
   useEffect(() => {
     activePeerRef.current = activePeer;
+    if (activePeer) {
+      setLogOpen(false);
+    } else {
+      setLogOpen(true);
+    }
   }, [activePeer]);
 
   const zeroizeAllKeys = useCallback(() => {
@@ -1161,19 +1167,6 @@ export default function Terminal() {
     };
   }, [checkHealth, connectWs, addMessage]);
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, activePeer]);
-
-  useEffect(() => {
-    if (!username || !hasKeys) return;
-    void replenishPrekeys();
-    const interval = setInterval(() => {
-      void replenishPrekeys();
-    }, 5 * 60 * 1000);
-    return () => clearInterval(interval);
-  }, [username, hasKeys, replenishPrekeys]);
-
   const getCleanMessageText = (msg: Message) => {
     if (msg.type === "peer") {
       const peerName = msg.peer || activePeer;
@@ -1191,17 +1184,36 @@ export default function Terminal() {
     return msg.text;
   };
 
-  const displayedMessages = messages.filter((m) => {
-    if (m.type === "system" && !m.isCmdResult) {
-      return false;
+  const chatMessages = messages.filter(
+    (m) =>
+      Boolean(activePeer) &&
+      m.peer === activePeer &&
+      (m.type === "user" || m.type === "peer") &&
+      !m.isCmdResult,
+  );
+
+  const consoleMessages = messages.filter(
+    (m) => m.type === "command" || Boolean(m.isCmdResult) || m.type === "system",
+  );
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatMessages, activePeer]);
+
+  useEffect(() => {
+    if (logOpen || !activePeer) {
+      consoleBottomRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-    if (!activePeer) {
-      return m.type === "command" || m.isCmdResult;
-    }
-    if (m.peer === activePeer) return true;
-    if (!m.peer && (m.type === "command" || m.isCmdResult)) return true;
-    return false;
-  });
+  }, [consoleMessages, logOpen, activePeer]);
+
+  useEffect(() => {
+    if (!username || !hasKeys) return;
+    void replenishPrekeys();
+    const interval = setInterval(() => {
+      void replenishPrekeys();
+    }, 5 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, [username, hasKeys, replenishPrekeys]);
 
   // ─── Commands ─────────────────────────────────────────────────────────────
 
@@ -1211,6 +1223,9 @@ export default function Terminal() {
 
     if (trimmed.startsWith("/")) {
       addMessage("command", trimmed, activePeer ?? undefined);
+      if (activePeer) {
+        setLogOpen(true);
+      }
     }
 
     const parts = trimmed.split(/\s+/);
@@ -1221,6 +1236,7 @@ export default function Terminal() {
         addCommandResult(
           `Available commands:
   /help                  Show this help
+  /log                   Toggle console & system log drawer
   /register <username>   Create identity + prekeys
   /login <username>      Login and load keys + history
   /new <user>            Start or restore session with user
@@ -1247,6 +1263,16 @@ export default function Terminal() {
           activePeer ?? undefined,
         );
         break;
+
+      case "/log":
+      case "/console": {
+        setLogOpen((prev) => !prev);
+        addCommandResult(
+          `Console drawer toggled ${!logOpen ? "open" : "closed"}.`,
+          activePeer ?? undefined,
+        );
+        break;
+      }
 
       case "/chats": {
         if (contacts.length === 0) {
@@ -1899,11 +1925,24 @@ export default function Terminal() {
         if (activePeer && username) {
           clearChatHistory(username, activePeer);
           setMessages((prev) =>
-            prev.filter((m) => m.peer !== activePeer),
+            prev.filter(
+              (m) =>
+                !(
+                  m.peer === activePeer &&
+                  (m.type === "user" || m.type === "peer") &&
+                  !m.isCmdResult
+                ),
+            ),
           );
           addCommandResult(`Cleared chat history with ${activePeer}.`, activePeer);
         } else {
-          addCommandResult("No active chat to clear.", activePeer ?? undefined);
+          setMessages((prev) =>
+            prev.filter(
+              (m) =>
+                (m.type === "user" || m.type === "peer") && !m.isCmdResult,
+            ),
+          );
+          addCommandResult("Console cleared.", undefined);
         }
         break;
 
@@ -2460,6 +2499,36 @@ export default function Terminal() {
           </div>
 
           <div className="flex items-center gap-2 text-xs">
+            <button
+              onClick={() => setLogOpen((prev) => !prev)}
+              className={`text-[11px] px-2.5 py-0.5 rounded border flex items-center gap-1.5 transition-all font-mono ${
+                logOpen
+                  ? "text-[#00ff41] bg-[#00ff41]/15 border-[#00ff41]/50 shadow-[0_0_8px_rgba(0,255,65,0.2)]"
+                  : "text-[#888888] bg-[#111111]/60 border-[#333333] hover:text-[#00ff41] hover:border-[#00ff41]/40"
+              }`}
+              title={
+                activePeer
+                  ? logOpen
+                    ? "Collapse Console & System Log (or /log)"
+                    : "Open Console & System Log (or /log)"
+                  : "Console stream active"
+              }
+            >
+              <span>⌨️</span>
+              <span>Console</span>
+              {consoleMessages.length > 0 && (
+                <span
+                  className={`text-[9px] px-1.5 py-0.2 rounded-full font-bold ${
+                    logOpen
+                      ? "bg-[#00ff41]/25 text-[#00ff41]"
+                      : "bg-[#222222] text-[#888888]"
+                  }`}
+                >
+                  {consoleMessages.length}
+                </span>
+              )}
+            </button>
+
             {username && (
               <button
                 onClick={() => lockSession("User clicked Lock button")}
@@ -2514,10 +2583,171 @@ export default function Terminal() {
           </div>
         </div>
 
-        {/* Main Terminal Chat & Command Feed */}
-        <div className="flex-1 overflow-y-auto px-4 py-3 text-sm leading-relaxed space-y-2 font-mono scroll-smooth select-text">
-          {displayedMessages.length === 0 ? (
-            !activePeer ? (
+        {/* Main Area: Split into Chat Stream & Optional Console Drawer */}
+        {activePeer ? (
+          <div className="flex-1 flex flex-col min-h-0 relative">
+            {/* Active Peer Chat Feed (Pure conversation only) */}
+            <div className="flex-1 overflow-y-auto px-4 py-3 text-sm leading-relaxed space-y-2 font-mono scroll-smooth select-text min-h-0">
+              {chatMessages.length === 0 ? (
+                <div className="py-12 flex flex-col items-center justify-center text-center space-y-2 text-xs select-none">
+                  <div className="text-[#00e5ff] font-semibold text-sm flex items-center gap-1.5">
+                    <span>🔒</span> Secure E2EE Channel Established with {activePeer}
+                  </div>
+                  <div className="text-[#00551a] max-w-md font-mono">
+                    Messages are end-to-end encrypted with X3DH &amp; Double Ratchet with constant-size padding.
+                  </div>
+                  <div className="flex gap-2 pt-2">
+                    <button
+                      onClick={() => handleCommand("/verify")}
+                      className="px-2.5 py-1 rounded bg-[#00220a] border border-[#00551a] text-[#00ff66] hover:bg-[#003810] transition-all font-mono"
+                    >
+                      🛡️ Verify Safety Number
+                    </button>
+                    <button
+                      onClick={() => handleCommand("/disappear 5m")}
+                      className="px-2.5 py-1 rounded bg-[#00220a] border border-[#00551a] text-[#ffb000] hover:bg-[#003810] transition-all font-mono"
+                    >
+                      ⏱️ Set 5m Disappear
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                chatMessages.map((msg) => (
+                  <div
+                    key={msg.id}
+                    className="group flex gap-2.5 items-start py-0.5 hover:bg-[#041207]/40 px-2 rounded transition-colors"
+                  >
+                    {/* Timestamp */}
+                    <span className="text-[#00551a] text-[11px] shrink-0 w-16 pt-0.5 font-mono select-none text-right">
+                      {formatTime(msg.timestamp)}
+                    </span>
+
+                    {/* Sender Badge */}
+                    <span className="shrink-0 w-20 pt-0.5 flex justify-end">
+                      {msg.type === "user" ? (
+                        <span className="text-[#ffb000] font-semibold text-[11px] px-1.5 py-0.2 rounded bg-[#ffb000]/10 border border-[#ffb000]/30 select-none">
+                          you
+                        </span>
+                      ) : (
+                        <span
+                          className="text-[#00e5ff] font-semibold text-[11px] px-1.5 py-0.2 rounded bg-[#00e5ff]/10 border border-[#00e5ff]/30 select-none truncate max-w-full text-right"
+                          title={msg.peer || activePeer || "peer"}
+                        >
+                          {msg.peer || activePeer || "peer"}
+                        </span>
+                      )}
+                    </span>
+
+                    {/* Message Content */}
+                    <div className="flex-1 min-w-0">
+                      {msg.type === "user" ? (
+                        <div className="text-[#00ff66] text-sm break-words leading-relaxed font-mono">
+                          {msg.text}
+                        </div>
+                      ) : (
+                        <div className="text-[#e2f7fa] text-sm break-words leading-relaxed font-mono">
+                          {getCleanMessageText(msg)}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))
+              )}
+              <div ref={bottomRef} />
+            </div>
+
+            {/* Collapsible Console Drawer when in chat */}
+            {logOpen && (
+              <div className="h-60 sm:h-64 border-t-2 border-[#004414] bg-[#020b04]/95 backdrop-blur-md flex flex-col shrink-0 shadow-[0_-8px_24px_rgba(0,0,0,0.7)]">
+                {/* Console Drawer Header */}
+                <div className="px-3 py-1.5 bg-[#031508] border-b border-[#003311] flex items-center justify-between text-xs font-mono select-none">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[#00ff41] font-bold">&gt;_</span>
+                    <span className="text-[#00ff41] font-semibold tracking-wider text-[11px]">
+                      CONSOLE &amp; SYSTEM LOG
+                    </span>
+                    <span className="text-[10px] text-[#00aa2a] bg-[#00220a] border border-[#004414] px-1.5 py-0.2 rounded">
+                      {consoleMessages.length} events
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() =>
+                        setMessages((prev) =>
+                          prev.filter(
+                            (m) =>
+                              (m.type === "user" || m.type === "peer") &&
+                              !m.isCmdResult,
+                          ),
+                        )
+                      }
+                      className="text-[10px] text-[#00aa2a] hover:text-[#00ff41] hover:underline px-1 py-0.5"
+                      title="Clear console output"
+                    >
+                      🧹 Clear Log
+                    </button>
+                    <button
+                      onClick={() => setLogOpen(false)}
+                      className="text-[11px] text-[#888888] hover:text-[#ff4444] px-1.5 py-0.5 rounded hover:bg-[#200000] transition-colors"
+                      title="Collapse console drawer (or /log)"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                </div>
+
+                {/* Console Drawer Logs List */}
+                <div className="flex-1 overflow-y-auto px-4 py-2 text-xs leading-relaxed space-y-1.5 font-mono scroll-smooth select-text bg-[#010803]/80">
+                  {consoleMessages.length === 0 ? (
+                    <div className="text-[#00551a] italic py-6 text-center text-xs">
+                      Console is empty. Run /help or commands to view logs here.
+                    </div>
+                  ) : (
+                    consoleMessages.map((msg) => (
+                      <div
+                        key={msg.id}
+                        className="group flex gap-2 items-start py-0.5 hover:bg-[#041407]/40 px-1 rounded transition-colors"
+                      >
+                        <span className="text-[#00551a] text-[10px] shrink-0 w-14 pt-0.5 font-mono select-none text-right">
+                          {formatTime(msg.timestamp)}
+                        </span>
+                        <span className="shrink-0 w-12 pt-0.5 flex justify-end">
+                          {msg.type === "command" ? (
+                            <span className="text-[#c084fc] font-semibold text-[10px] px-1 py-0.2 rounded bg-[#a855f7]/15 border border-[#a855f7]/30 select-none">
+                              cmd
+                            </span>
+                          ) : (
+                            <span className="text-[#00ff41] font-semibold text-[10px] px-1 py-0.2 rounded bg-[#00ff41]/10 border border-[#00ff41]/30 select-none">
+                              sys
+                            </span>
+                          )}
+                        </span>
+                        <div className="flex-1 min-w-0">
+                          {msg.type === "command" ? (
+                            <div className="text-[#e9d5ff] font-mono text-xs flex items-center gap-1.5">
+                              <span className="text-[#a855f7] font-bold select-none">
+                                $
+                              </span>
+                              <span className="font-semibold">{msg.text}</span>
+                            </div>
+                          ) : (
+                            <div className="text-[#99e6aa] text-xs font-mono whitespace-pre-wrap leading-relaxed bg-[#021808]/70 border-l-2 border-[#00ff41]/50 px-2.5 py-1 rounded-r shadow-sm">
+                              {msg.text}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                  <div ref={consoleBottomRef} />
+                </div>
+              </div>
+            )}
+          </div>
+        ) : (
+          /* When !activePeer: Main view shows Console stream (register/login/help flow) */
+          <div className="flex-1 overflow-y-auto px-4 py-3 text-sm leading-relaxed space-y-2 font-mono scroll-smooth select-text min-h-0">
+            {consoleMessages.length === 0 ? (
               // Welcome Hero Banner when no chat is open
               <div className="py-8 flex flex-col items-center justify-center text-center max-w-xl mx-auto space-y-4 select-none">
                 <pre className="text-[#00ff41] text-[10px] sm:text-[11px] leading-tight opacity-75 font-mono drop-shadow-[0_0_8px_rgba(0,255,65,0.2)]">
@@ -2561,95 +2791,76 @@ export default function Terminal() {
                 </div>
               </div>
             ) : (
-              <div className="py-12 flex flex-col items-center justify-center text-center space-y-2 text-xs select-none">
-                <div className="text-[#00e5ff] font-semibold text-sm flex items-center gap-1.5">
-                  <span>🔒</span> Secure E2EE Channel Established with {activePeer}
-                </div>
-                <div className="text-[#00551a] max-w-md font-mono">
-                  Messages are end-to-end encrypted with X3DH & Double Ratchet with constant-size padding.
-                </div>
-                <div className="flex gap-2 pt-2">
-                  <button
-                    onClick={() => handleCommand("/verify")}
-                    className="px-2.5 py-1 rounded bg-[#00220a] border border-[#00551a] text-[#00ff66] hover:bg-[#003810] transition-all font-mono"
-                  >
-                    🛡️ Verify Safety Number
-                  </button>
-                  <button
-                    onClick={() => handleCommand("/disappear 5m")}
-                    className="px-2.5 py-1 rounded bg-[#00220a] border border-[#00551a] text-[#ffb000] hover:bg-[#003810] transition-all font-mono"
-                  >
-                    ⏱️ Set 5m Disappear
-                  </button>
-                </div>
-              </div>
-            )
-          ) : (
-            displayedMessages.map((msg) => (
-              <div
-                key={msg.id}
-                className="group flex gap-2.5 items-start py-0.5 hover:bg-[#041207]/40 px-2 rounded transition-colors"
-              >
-                {/* Timestamp */}
-                <span className="text-[#00551a] text-[11px] shrink-0 w-16 pt-0.5 font-mono select-none text-right">
-                  {formatTime(msg.timestamp)}
-                </span>
-
-                {/* Sender Badge */}
-                <span className="shrink-0 w-20 pt-0.5 flex justify-end">
-                  {msg.type === "user" && (
-                    <span className="text-[#ffb000] font-semibold text-[11px] px-1.5 py-0.2 rounded bg-[#ffb000]/10 border border-[#ffb000]/30 select-none">
-                      you
+              <>
+                <div className="pb-2 border-b border-[#003311] flex items-center justify-between text-xs text-[#00aa2a] select-none">
+                  <span className="flex items-center gap-1.5 font-bold tracking-wider">
+                    <span className="text-[#00ff41]">&gt;_</span> CONSOLE &amp; SYSTEM LOG STREAM
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] text-[#006622]">
+                      {consoleMessages.length} events
                     </span>
-                  )}
-                  {msg.type === "peer" && (
-                    <span
-                      className="text-[#00e5ff] font-semibold text-[11px] px-1.5 py-0.2 rounded bg-[#00e5ff]/10 border border-[#00e5ff]/30 select-none truncate max-w-full text-right"
-                      title={msg.peer || activePeer || "peer"}
+                    <button
+                      onClick={() =>
+                        setMessages((prev) =>
+                          prev.filter(
+                            (m) =>
+                              (m.type === "user" || m.type === "peer") &&
+                              !m.isCmdResult,
+                          ),
+                        )
+                      }
+                      className="text-[10px] text-[#00aa2a] hover:text-[#00ff41] hover:underline"
                     >
-                      {msg.peer || activePeer || "peer"}
-                    </span>
-                  )}
-                  {msg.type === "command" && (
-                    <span className="text-[#c084fc] font-semibold text-[11px] px-1.5 py-0.2 rounded bg-[#a855f7]/15 border border-[#a855f7]/30 select-none">
-                      cmd
-                    </span>
-                  )}
-                  {msg.type === "system" && (
-                    <span className="text-[#00ff41] font-semibold text-[11px] px-1.5 py-0.2 rounded bg-[#00ff41]/10 border border-[#00ff41]/30 select-none">
-                      sys
-                    </span>
-                  )}
-                </span>
-
-                {/* Message Content */}
-                <div className="flex-1 min-w-0">
-                  {msg.type === "system" ? (
-                    <div className="text-[#99e6aa] text-xs font-mono whitespace-pre-wrap leading-relaxed bg-[#021808]/70 border-l-2 border-[#00ff41]/50 px-3 py-1.5 rounded-r shadow-sm">
-                      {msg.text}
-                    </div>
-                  ) : msg.type === "command" ? (
-                    <div className="text-[#e9d5ff] font-mono text-sm flex items-center gap-1.5">
-                      <span className="text-[#a855f7] font-bold select-none">
-                        $
-                      </span>
-                      <span className="font-semibold">{msg.text}</span>
-                    </div>
-                  ) : msg.type === "user" ? (
-                    <div className="text-[#00ff66] text-sm break-words leading-relaxed font-mono">
-                      {msg.text}
-                    </div>
-                  ) : (
-                    <div className="text-[#e2f7fa] text-sm break-words leading-relaxed font-mono">
-                      {getCleanMessageText(msg)}
-                    </div>
-                  )}
+                      Clear Console
+                    </button>
+                  </div>
                 </div>
-              </div>
-            ))
-          )}
-          <div ref={bottomRef} />
-        </div>
+                {consoleMessages.map((msg) => (
+                  <div
+                    key={msg.id}
+                    className="group flex gap-2.5 items-start py-0.5 hover:bg-[#041207]/40 px-2 rounded transition-colors"
+                  >
+                    {/* Timestamp */}
+                    <span className="text-[#00551a] text-[11px] shrink-0 w-16 pt-0.5 font-mono select-none text-right">
+                      {formatTime(msg.timestamp)}
+                    </span>
+
+                    {/* Sender Badge */}
+                    <span className="shrink-0 w-16 pt-0.5 flex justify-end">
+                      {msg.type === "command" ? (
+                        <span className="text-[#c084fc] font-semibold text-[11px] px-1.5 py-0.2 rounded bg-[#a855f7]/15 border border-[#a855f7]/30 select-none">
+                          cmd
+                        </span>
+                      ) : (
+                        <span className="text-[#00ff41] font-semibold text-[11px] px-1.5 py-0.2 rounded bg-[#00ff41]/10 border border-[#00ff41]/30 select-none">
+                          sys
+                        </span>
+                      )}
+                    </span>
+
+                    {/* Message Content */}
+                    <div className="flex-1 min-w-0">
+                      {msg.type === "command" ? (
+                        <div className="text-[#e9d5ff] font-mono text-sm flex items-center gap-1.5">
+                          <span className="text-[#a855f7] font-bold select-none">
+                            $
+                          </span>
+                          <span className="font-semibold">{msg.text}</span>
+                        </div>
+                      ) : (
+                        <div className="text-[#99e6aa] text-xs font-mono whitespace-pre-wrap leading-relaxed bg-[#021808]/70 border-l-2 border-[#00ff41]/50 px-3 py-1.5 rounded-r shadow-sm">
+                          {msg.text}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </>
+            )}
+            <div ref={consoleBottomRef} />
+          </div>
+        )}
 
         {/* Quick Commands Bar above input */}
         <div className="px-4 py-1.5 flex items-center gap-2 overflow-x-auto text-[11px] border-t border-[#00280c] bg-[#020b04] select-none scrollbar-none">
@@ -2658,6 +2869,7 @@ export default function Terminal() {
           </span>
           {[
             { label: "/help", cmd: "/help" },
+            { label: "/log ⌨️", cmd: "/log" },
             { label: "/verify 🛡️", cmd: "/verify" },
             { label: "/disappear 5m ⏱️", cmd: "/disappear 5m" },
             { label: "/status ⚡", cmd: "/status" },
