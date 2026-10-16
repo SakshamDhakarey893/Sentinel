@@ -1,0 +1,100 @@
+rules_version = '2';
+
+// ==============================================================================
+// Sentinel — Cloud Firestore Security Rules
+// ==============================================================================
+// Deploy this file to Firebase using the Firebase CLI:
+//   firebase deploy --only firestore:rules
+//
+// Threat Model & Zero-Knowledge Security Architecture:
+// 1. Firebase Web Configuration (API key, project ID) is embedded in the client
+//    and is inherently public. All access restrictions MUST be enforced here.
+// 2. Sentinel uses client-side Zero-Knowledge encryption (AES-256-GCM with a key
+//    derived via PBKDF2 with 600,000 SHA-256 iterations from user passphrase).
+//    The Firestore database only stores encrypted ciphertext blobs.
+// 3. User Privacy: Querying, enumerating, or listing the `encrypted_vaults`
+//    collection is STRICTLY FORBIDDEN to prevent username discovery.
+//
+// TODO (Production Hardening):
+// To achieve maximum security in multi-tenant production:
+// - Issue Firebase Custom Auth Tokens from the Sentinel relay server upon successful
+//   ECDH challenge-response authentication.
+// - Lock `get` and `write` strictly to:
+//   `request.auth != null && request.auth.uid == vaultId`
+// ==============================================================================
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: encrypted_vaults
+// Document ID: {vaultId} (Normalized lowercase username)
+// Fields:
+//   - username: string (required) - Lowercase username, must match document ID
+//   - salt: string (required) - Base64-encoded PBKDF2 salt (16-64 chars)
+//   - iv: string (required) - Base64-encoded AES-GCM IV (12-64 chars)
+//   - ciphertext: string (required) - Base64-encoded zero-knowledge ciphertext (max 1MB)
+//   - updatedAt: string (required) - ISO-8601 timestamp string
+//   - v: int (required) - Schema version, must be 1
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny: All collections not explicitly granted are completely inaccessible
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions for validation
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(vaultId) {
+      return isAuthenticated() && (request.auth.uid == vaultId || request.auth.token.username == vaultId);
+    }
+
+    function isValidVaultPayload(vaultId) {
+      let data = request.resource.data;
+      return data.keys().hasAll(['username', 'salt', 'iv', 'ciphertext', 'updatedAt', 'v'])
+        && data.keys().hasOnly(['username', 'salt', 'iv', 'ciphertext', 'updatedAt', 'v'])
+        && data.username is string
+        && data.username == vaultId
+        && data.salt is string
+        && data.salt.size() >= 16
+        && data.salt.size() <= 64
+        && data.iv is string
+        && data.iv.size() >= 12
+        && data.iv.size() <= 64
+        && data.ciphertext is string
+        && data.ciphertext.size() > 0
+        && data.ciphertext.size() <= 1048576 // 1MB payload limit protects against storage exhaustion
+        && data.v is int
+        && data.v == 1
+        && data.updatedAt is string
+        && data.updatedAt.size() <= 50;
+    }
+
+    match /encrypted_vaults/{vaultId} {
+      // STRICT PRIVACY: Disallow collection queries/enumeration.
+      // Eavesdroppers or malicious users cannot list documents to scrape user identities.
+      allow list: if false;
+
+      // Single document lookup by exact known vault ID:
+      // In production with Firebase Auth, requires request.auth.uid == vaultId.
+      // In current anonymous mode, allows direct get by exact document key only.
+      allow get: if isAuthenticated() ? isOwner(vaultId) : true;
+
+      // Vault storage and updates:
+      // Validates ciphertext structure, payload bounds, and username consistency.
+      // If Firebase Auth is enabled, enforces strict ownership.
+      allow create, update: if (isAuthenticated() ? isOwner(vaultId) : true)
+                           && isValidVaultPayload(vaultId);
+
+      // Prevent destructive deletion of backups from client
+      allow delete: if false;
+    }
+  }
+}

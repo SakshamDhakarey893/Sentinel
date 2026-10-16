@@ -3,7 +3,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -271,10 +271,37 @@ async fn main() {
         challenges: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = if let Ok(allowed) = std::env::var("ALLOWED_ORIGINS") {
+        let origins: Vec<HeaderValue> = allowed
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse::<HeaderValue>().ok())
+            .collect();
+
+        if !origins.is_empty() {
+            tracing::info!(
+                "CORS configured with explicit allowed origins (production lock): {:?}",
+                origins
+            );
+            CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods(Any)
+                .allow_headers(Any)
+        } else {
+            tracing::warn!("ALLOWED_ORIGINS was empty; defaulting to permissive CORS for development");
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any)
+        }
+    } else {
+        tracing::info!("ALLOWED_ORIGINS not set; defaulting to permissive CORS for local development");
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    };
 
     let app = Router::new()
         .route("/", get(root))

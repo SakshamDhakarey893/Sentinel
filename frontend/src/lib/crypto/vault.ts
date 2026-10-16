@@ -1,3 +1,26 @@
+/**
+ * ============================================================================
+ * SECURITY ARCHITECTURE NOTE: Private Key Storage (Desktop & Web)
+ * ============================================================================
+ * Current Implementation:
+ * - Private keys, signed prekeys, and one-time prekeys are stored locally in
+ *   encrypted form using AES-256-GCM.
+ * - Key derivation uses PBKDF2 with HMAC-SHA256 and 100,000 iterations from
+ *   the user's master vault passphrase.
+ * - Ciphertext blobs are stored in `localStorage` under namespaced keys
+ *   (`sentinel_priv_<user>`, `sentinel_spk_<user>`, `sentinel_opks_<user>`).
+ * - In memory, keys and ratchet states are explicitly scrubbed and zeroized
+ *   via `zeroizeBuffer` on logout, app lock, or panic purge.
+ * 
+ * Future Hardening Option (TODO):
+ * - Transition from localStorage encryption to OS-native hardware-backed keychains
+ *   (Windows Credential Manager / DPAPI, macOS Keychain, Linux Secret Service)
+ *   utilizing Tauri native plugins (e.g. `tauri-plugin-stronghold` or OS keystore FFI).
+ * - Keep private keys strictly in memory during an active session and never write
+ *   raw key material to browser storage.
+ * ============================================================================
+ */
+
 export const CANARY_PAYLOAD = "SENTINEL_VAULT_V1_OK";
 
 export function zeroizeBuffer(buf: ArrayBuffer | Uint8Array | null | undefined) {

@@ -81,12 +81,16 @@ pub fn init_db(path_str: &str) -> Result<Connection> {
         CREATE TABLE IF NOT EXISTS sessions (
             token TEXT PRIMARY KEY,
             username TEXT NOT NULL COLLATE NOCASE,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(username);",
     )
     .context("Failed to initialize SQLite tables")?;
+
+    // Auto-migrate: Add expires_at column to sessions table if upgrading from older schema
+    let _ = conn.execute("ALTER TABLE sessions ADD COLUMN expires_at TEXT", []);
 
     // Auto-migrate from legacy JSON files if they exist
     migrate_from_json(&conn)?;
@@ -360,25 +364,81 @@ pub fn pop_queued_messages(conn: &Connection, to_user: &str) -> Result<Vec<Queue
 
 // ─── Sessions ──────────────────────────────────────────────────────────────
 
+pub fn get_session_ttl_secs() -> i64 {
+    std::env::var("SESSION_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(7 * 24 * 3600) // Default: 7 days (604,800 seconds)
+}
+
 pub fn save_session(conn: &Connection, token: &str, username: &str) -> Result<()> {
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = chrono::Utc::now();
+    let ttl = get_session_ttl_secs();
+    let expires = now + chrono::Duration::seconds(ttl);
+
+    // Invalidate existing sessions for this username (token rotation upon authentication)
+    let _ = conn.execute(
+        "DELETE FROM sessions WHERE username = ?1 COLLATE NOCASE",
+        params![username],
+    );
+
     conn.execute(
-        "INSERT OR REPLACE INTO sessions (token, username, created_at) VALUES (?1, ?2, ?3)",
-        params![token, username.to_lowercase(), now],
+        "INSERT INTO sessions (token, username, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            token,
+            username.to_lowercase(),
+            now.to_rfc3339(),
+            expires.to_rfc3339(),
+        ],
     )?;
     Ok(())
 }
 
 pub fn verify_session(conn: &Connection, token: &str, username: &str) -> Result<bool> {
     let mut stmt = conn.prepare(
-        "SELECT username FROM sessions WHERE token = ?1",
+        "SELECT username, created_at, expires_at FROM sessions WHERE token = ?1",
     )?;
-    let res = stmt.query_row(params![token], |row| row.get::<_, String>(0));
+    let res = stmt.query_row(params![token], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    });
+
     match res {
-        Ok(stored_user) => Ok(stored_user.eq_ignore_ascii_case(username)),
+        Ok((stored_user, created_at_opt, expires_at_opt)) => {
+            let now = chrono::Utc::now();
+            let is_expired = if let Some(exp_str) = expires_at_opt {
+                chrono::DateTime::parse_from_rfc3339(&exp_str)
+                    .map(|exp| now > exp)
+                    .unwrap_or(false)
+            } else if let Some(created_str) = created_at_opt {
+                chrono::DateTime::parse_from_rfc3339(&created_str)
+                    .map(|created| now > created + chrono::Duration::seconds(get_session_ttl_secs()))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+
+            if is_expired {
+                // Reject expired sessions and purge them from the database
+                let _ = conn.execute("DELETE FROM sessions WHERE token = ?1", params![token]);
+                return Ok(false);
+            }
+
+            Ok(stored_user.eq_ignore_ascii_case(username))
+        }
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
         Err(e) => Err(e.into()),
     }
+}
+
+#[allow(dead_code)]
+pub fn invalidate_session(conn: &Connection, token: &str) -> Result<()> {
+    conn.execute("DELETE FROM sessions WHERE token = ?1", params![token])?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -411,7 +471,8 @@ mod tests {
             CREATE TABLE sessions (
                 token TEXT PRIMARY KEY,
                 username TEXT NOT NULL COLLATE NOCASE,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
             );",
         )
         .unwrap();
@@ -482,6 +543,23 @@ mod tests {
         assert!(verify_session(&conn, "tok-123", "CHARLIE").unwrap());
         assert!(!verify_session(&conn, "tok-123", "dave").unwrap());
         assert!(!verify_session(&conn, "wrong-tok", "charlie").unwrap());
+
+        // Test token rotation on new save_session for same username
+        save_session(&conn, "tok-456", "charlie").unwrap();
+        assert!(!verify_session(&conn, "tok-123", "charlie").unwrap());
+        assert!(verify_session(&conn, "tok-456", "charlie").unwrap());
+
+        // Test expired session rejection and cleanup
+        let past = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO sessions (token, username, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+            params!["expired-tok", "dave", past, past],
+        ).unwrap();
+        assert!(!verify_session(&conn, "expired-tok", "dave").unwrap());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions WHERE token = 'expired-tok'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
 
         // Test offline message queue
         let msg1 = QueuedMessage {

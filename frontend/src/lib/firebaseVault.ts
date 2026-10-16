@@ -11,6 +11,21 @@ export interface CloudVaultPayload {
   exportedAt: string;
 }
 
+/**
+ * TODO (Security & Production Hardening):
+ * Firebase Auth custom tokens are not yet integrated into the client workflow.
+ * In production multi-tenant deployments, the Sentinel relay server should mint
+ * Firebase Custom Auth tokens upon successful ECDH challenge-response authentication.
+ * The client would then invoke `signInWithCustomToken(auth, token)` to allow firestore.rules
+ * to lock read/write access strictly to `request.auth.uid == username`.
+ * 
+ * Current Protection Model:
+ * 1. Zero-Knowledge Encryption: Private keys and ratchets are encrypted client-side using
+ *    AES-256-GCM with a 256-bit key derived via PBKDF2-SHA256 (600,000 iterations).
+ * 2. Un-enumerable Rules: `firestore.rules` sets `allow list: if false;` to block scraping
+ *    or discovery of user accounts, and enforces strict ciphertext payload schemas.
+ */
+
 const RUNTIME_CONFIG_KEY = "sentinel_firebase_config";
 
 const DEFAULT_FIREBASE_CONFIG: FirebaseOptions = {

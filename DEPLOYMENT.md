@@ -57,10 +57,16 @@ cp .env.example .env
 nano .env
 ```
 
-Set your domain in `.env`:
+Set your configuration in `.env`:
 ```env
 DOMAIN=relay.yourdomain.com
 CONTACT_EMAIL=admin@yourdomain.com
+
+# Lock CORS origins for production (comma-separated):
+ALLOWED_ORIGINS=https://relay.yourdomain.com,tauri://localhost,http://localhost:3000
+
+# Session token expiry TTL (in seconds, default: 604800 = 7 days):
+SESSION_TTL_SECS=604800
 ```
 
 ### Step 3: Launch with Docker Compose

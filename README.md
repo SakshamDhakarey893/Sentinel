@@ -130,6 +130,25 @@ GitHub Actions will automatically compile:
 
 And publish them directly to your repository's **GitHub Releases** with SHA-256 checksums.
 
+## Threat Model & Metadata Transparency
+
+Sentinel provides client-side end-to-end encryption (E2EE) using X3DH and the Double Ratchet protocol with AES-256-GCM. For complete details, see [SECURITY.md](SECURITY.md).
+
+- **What the Relay Can See**:
+  - Usernames involved in connections and active WebSocket sessions.
+  - Approximate timing of messages and user presence.
+  - Message ciphertext sizes and transmission cadence (traffic analysis mitigation is provided via discrete tiered padding).
+- **What the Relay Cannot See**:
+  - Message plaintext (keys are negotiated end-to-end between peers).
+  - Private identity keys, signed prekeys, or one-time prekeys (generated locally, never shared).
+  - Passphrases or Cloud Vault plaintext (zero-knowledge client-side encryption).
+- **Metadata Minimization**: Sentinel avoids collecting extraneous profile data (no phone numbers, emails, contacts, or read receipts). However, "metadata minimization" does not mean the relay is metadata-blind—the server must coordinate delivery between usernames.
+- **Safety Number Verification**: Always verify contact safety numbers or emoji hashes out-of-band via `/verify <peer>` to prevent relay-level man-in-the-middle key substitution.
+
+### Key Storage Note
+- **Current**: Passphrase-encrypted keys in `localStorage` (PBKDF2-HMAC-SHA256 with 100,000 iterations + AES-256-GCM). In-memory keys are scrubbed and zeroized upon lock, logout, or panic purge (`/panic`).
+- **Roadmap**: Hardware-backed OS keychain storage (Windows Credential Manager / DPAPI, macOS Keychain, Linux Secret Service) via native Tauri plugins.
+
 ## Current Status
 
 - [x] Project scaffolding

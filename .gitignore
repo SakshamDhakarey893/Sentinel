@@ -30,6 +30,7 @@ data/
 *.db-shm
 *.db-wal
 *.json
+!firebase.json
 
 # OS / Editor
 .DS_Store
