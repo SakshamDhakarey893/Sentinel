@@ -27,7 +27,7 @@ jobs:
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: sentinel/frontend/package-lock.json
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -35,14 +35,14 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: sentinel/frontend/src-tauri
+          workspaces: frontend/src-tauri
 
       - name: Install Frontend Dependencies
-        working-directory: sentinel/frontend
+        working-directory: frontend
         run: npm ci
 
       - name: Build Next.js & Tauri Desktop App
-        working-directory: sentinel/frontend
+        working-directory: frontend
         run: npm run tauri:build
 
       - name: Package Desktop Artifacts
@@ -51,21 +51,21 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist-desktop
           
           # Find NSIS .exe setup installer
-          $nsis = Get-ChildItem -Path sentinel/frontend/src-tauri/target/release/bundle/nsis/*.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          $nsis = Get-ChildItem -Path frontend/src-tauri/target/release/bundle/nsis/*.exe -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($nsis) {
             Copy-Item $nsis.FullName -Destination "dist-desktop/Sentinel-Desktop-Setup-x64.exe"
             Write-Host "Found NSIS Setup: $($nsis.FullName)"
           }
 
           # Find MSI installer
-          $msi = Get-ChildItem -Path sentinel/frontend/src-tauri/target/release/bundle/msi/*.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          $msi = Get-ChildItem -Path frontend/src-tauri/target/release/bundle/msi/*.msi -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($msi) {
             Copy-Item $msi.FullName -Destination "dist-desktop/Sentinel-Desktop-x64.msi"
             Write-Host "Found MSI Installer: $($msi.FullName)"
           }
 
           # Find Standalone .exe and zip it
-          $standalone = "sentinel/frontend/src-tauri/target/release/sentinel.exe"
+          $standalone = "frontend/src-tauri/target/release/sentinel.exe"
           if (Test-Path $standalone) {
             Compress-Archive -Path $standalone -DestinationPath "dist-desktop/Sentinel-Desktop-Portable-x64.zip" -Force
             Write-Host "Packaged Standalone Portable Zip"
@@ -85,17 +85,17 @@ jobs:
         include:
           - os: windows-latest
             artifact_name: sentinel-backend-windows-x64.zip
-            binary_src: sentinel/backend/target/release/sentinel-backend.exe
+            binary_src: backend/target/release/sentinel-backend.exe
             archive_cmd: pwsh
             archive_script: |
-              Compress-Archive -Path sentinel/backend/target/release/sentinel-backend.exe -DestinationPath sentinel-backend-windows-x64.zip -Force
+              Compress-Archive -Path backend/target/release/sentinel-backend.exe -DestinationPath sentinel-backend-windows-x64.zip -Force
           - os: ubuntu-latest
             artifact_name: sentinel-backend-linux-x86_64.tar.gz
-            binary_src: sentinel/backend/target/release/sentinel-backend
+            binary_src: backend/target/release/sentinel-backend
             archive_cmd: bash
             archive_script: |
-              strip sentinel/backend/target/release/sentinel-backend
-              tar -czvf sentinel-backend-linux-x86_64.tar.gz -C sentinel/backend/target/release sentinel-backend
+              strip backend/target/release/sentinel-backend
+              tar -czvf sentinel-backend-linux-x86_64.tar.gz -C backend/target/release sentinel-backend
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -106,10 +106,10 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: sentinel/backend
+          workspaces: backend
 
       - name: Build Release Binary
-        working-directory: sentinel/backend
+        working-directory: backend
         run: cargo build --release
 
       - name: Package Binary
