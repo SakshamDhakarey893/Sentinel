@@ -1,7 +1,6 @@
 {
     # Global options
     admin off
-    email {$CONTACT_EMAIL:admin@localhost}
 }
 
 # The relay server domain (e.g., relay.yourdomain.com or localhost)
