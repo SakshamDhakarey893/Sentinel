@@ -24,8 +24,12 @@ src-tauri/target/
 **/src-tauri/target/
 
 # Local databases & runtime state
-backend/data/*.json
-data/*.json
+backend/data/
+data/
+*.db
+*.db-shm
+*.db-wal
+*.json
 
 # OS / Editor
 .DS_Store
