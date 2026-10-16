@@ -78,14 +78,18 @@ npm run tauri:dev
 
 This starts the Next.js dev server and opens a native window.
 
-#### Build installable desktop app
+#### Build installable desktop app (.exe / .msi)
 
+You can build the production desktop application locally with a single click:
+```cmd
+sentinel\scripts\build-desktop-exe.bat
+```
+Or using npm directly:
 ```bash
+cd frontend
 npm run tauri:build
 ```
-
-Output appears in `frontend/src-tauri/target/release/bundle/`  
-(Windows installer, macOS `.app` / `.dmg`, Linux AppImage / deb / rpm)
+Output appears in `sentinel/dist/` or `frontend/src-tauri/target/release/bundle/nsis/`.
 
 ### 2. Backend (message relay)
 
@@ -110,6 +114,22 @@ You can point the Sentinel frontend or desktop app to any local or remote relay 
   * Switch to remote server: `/server https://relay.yourdomain.com`
   * Reset to default: `/server reset`
 
+For 24/7 cloud server hosting via Docker Compose and automated Let's Encrypt SSL/TLS, see [DEPLOYMENT.md](DEPLOYMENT.md).
+
+### 4. Automated CI/CD Releases (GitHub Actions)
+
+Push a version tag to trigger an automated release build:
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+GitHub Actions will automatically compile:
+* **Sentinel-Desktop-Setup-x64.exe** (Windows installer)
+* **Sentinel-Desktop-Portable-x64.zip** (Portable standalone executable)
+* **sentinel-backend-windows-x64.zip** & **sentinel-backend-linux-x86_64.tar.gz**
+
+And publish them directly to your repository's **GitHub Releases** with SHA-256 checksums.
+
 ## Current Status
 
 - [x] Project scaffolding
@@ -127,6 +147,7 @@ You can point the Sentinel frontend or desktop app to any local or remote relay 
 - [x] Cryptographic challenge-response authentication on relay (ECDH + HMAC-SHA256 zero-knowledge proof)
 - [x] Embedded SQLite database persistence (WAL mode, atomic one-time prekey consumption, auto-migration)
 - [x] 24/7 Production Deployment stack (Docker Compose, Caddy auto-TLS reverse proxy, systemd, Windows background auto-start)
+- [x] Automated GitHub Actions CI/CD release pipeline for Windows .exe releases & desktop bundling
 
 ## License
 
