@@ -8,8 +8,8 @@ on:
     inputs:
       tag_name:
         description: "Release tag (e.g. v0.2.0)"
-        required: false
-        default: "manual-build"
+        required: true
+        default: "v0.2.0"
 
 permissions:
   contents: write
@@ -49,27 +49,46 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist-desktop
-          
-          # Find NSIS .exe setup installer
-          $nsis = Get-ChildItem -Path frontend/src-tauri/target/release/bundle/nsis/*.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+
+          # Collect NSIS .exe setup installer if present
+          $nsis = Get-ChildItem -Path "frontend/src-tauri/target/release/bundle/nsis/*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($nsis) {
             Copy-Item $nsis.FullName -Destination "dist-desktop/Sentinel-Desktop-Setup-x64.exe"
             Write-Host "Found NSIS Setup: $($nsis.FullName)"
+          } else {
+            Write-Host "No NSIS installer found under bundle/nsis/"
           }
 
-          # Find MSI installer
-          $msi = Get-ChildItem -Path frontend/src-tauri/target/release/bundle/msi/*.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          # Collect MSI installer if present
+          $msi = Get-ChildItem -Path "frontend/src-tauri/target/release/bundle/msi/*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($msi) {
             Copy-Item $msi.FullName -Destination "dist-desktop/Sentinel-Desktop-x64.msi"
             Write-Host "Found MSI Installer: $($msi.FullName)"
+          } else {
+            Write-Host "No MSI installer found under bundle/msi/"
           }
 
-          # Find Standalone .exe and zip it
-          $standalone = "frontend/src-tauri/target/release/sentinel.exe"
-          if (Test-Path $standalone) {
-            Compress-Archive -Path $standalone -DestinationPath "dist-desktop/Sentinel-Desktop-Portable-x64.zip" -Force
-            Write-Host "Packaged Standalone Portable Zip"
+          # Collect standalone/portable .exe and create portable zip
+          $standalone = Get-ChildItem -Path "frontend/src-tauri/target/release/*.exe" -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike "*setup*" -and $_.Name -notlike "*installer*" } | Select-Object -First 1
+          if ($standalone) {
+            Compress-Archive -Path $standalone.FullName -DestinationPath "dist-desktop/Sentinel-Desktop-Portable-x64.zip" -Force
+            Write-Host "Packaged Standalone Portable Zip from: $($standalone.FullName)"
+          } elseif (Test-Path "frontend/src-tauri/target/release/sentinel.exe") {
+            Compress-Archive -Path "frontend/src-tauri/target/release/sentinel.exe" -DestinationPath "dist-desktop/Sentinel-Desktop-Portable-x64.zip" -Force
+            Write-Host "Packaged Standalone Portable Zip from frontend/src-tauri/target/release/sentinel.exe"
+          } else {
+            Write-Host "No standalone .exe found under frontend/src-tauri/target/release/"
           }
+
+          # Verify at least one desktop artifact was collected
+          $collected = Get-ChildItem -Path dist-desktop -File
+          if (-not $collected -or $collected.Count -eq 0) {
+            Write-Error "Build failed: Zero desktop artifacts were produced in dist-desktop!"
+            exit 1
+          }
+
+          Write-Host "Desktop artifacts collected:"
+          $collected | ForEach-Object { Write-Host " - $($_.Name) ($($_.Length) bytes)" }
 
       - name: Upload Desktop Artifacts
         uses: actions/upload-artifact@v4
@@ -78,24 +97,15 @@ jobs:
           path: dist-desktop/*
 
   build-backend-binaries:
-    name: Build Relay Server Binaries
+    name: Build Relay Server (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
           - os: windows-latest
             artifact_name: sentinel-backend-windows-x64.zip
-            binary_src: backend/target/release/sentinel-backend.exe
-            archive_cmd: pwsh
-            archive_script: |
-              Compress-Archive -Path backend/target/release/sentinel-backend.exe -DestinationPath sentinel-backend-windows-x64.zip -Force
           - os: ubuntu-latest
             artifact_name: sentinel-backend-linux-x86_64.tar.gz
-            binary_src: backend/target/release/sentinel-backend
-            archive_cmd: bash
-            archive_script: |
-              strip backend/target/release/sentinel-backend
-              tar -czvf sentinel-backend-linux-x86_64.tar.gz -C backend/target/release sentinel-backend
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -112,9 +122,18 @@ jobs:
         working-directory: backend
         run: cargo build --release
 
-      - name: Package Binary
-        shell: ${{ matrix.archive_cmd }}
-        run: ${{ matrix.archive_script }}
+      - name: Package Binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path backend/target/release/sentinel-backend.exe -DestinationPath sentinel-backend-windows-x64.zip -Force
+
+      - name: Package Binary (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          strip backend/target/release/sentinel-backend || true
+          tar -czvf sentinel-backend-linux-x86_64.tar.gz -C backend/target/release sentinel-backend
 
       - name: Upload Backend Binary Artifact
         uses: actions/upload-artifact@v4
@@ -144,11 +163,16 @@ jobs:
 
       - name: Determine Tag
         id: vars
+        shell: bash
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag_name }}"
+            TAG="${{ inputs.tag_name || github.event.inputs.tag_name }}"
           else
             TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "Error: Tag name could not be determined."
+            exit 1
           fi
           echo "tag=$TAG" >> $GITHUB_OUTPUT
 
@@ -162,3 +186,5 @@ jobs:
           generate_release_notes: true
           files: |
             release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
